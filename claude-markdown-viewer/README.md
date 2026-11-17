@@ -1,84 +1,78 @@
 # Claude Markdown Viewer
 
-Obsidian-Plugin für Markdown aus Claude Docs (Markdown-Export), Claude-Chats und Claude Code. Es zeigt jede Datei wahlweise so, wie Claude sie darstellt, oder nach der Norm (Markdown-Standard wie auf GitHub). Es ist ein reiner Viewer: Es liest Dateien nur, schreibt nie in Notizen und hat keine Bearbeitungsfunktionen, auch nicht für Tabellen.
+Obsidian-Plugin für Markdown aus Claude Docs (Markdown-Export), Claude-Chats und Claude Code. Es zeigt jede Datei immer fertig dargestellt: Formeln, Tabellen, Klappbereiche, Bilder. Es gibt keine Umschalter und keine Quelltext-Ansicht; wer den Quelltext sehen will, öffnet die Datei in einem Texteditor. Das Plugin ist ein reiner Viewer: Es liest Dateien nur und schreibt nie in Notizen.
 
 ## Installation
 
-1. In Obsidian: Einstellungen → Community-Erweiterungen (Community plugins) → Eingeschränkten Modus ausschalten.
+1. In Obsidian: Einstellungen → Community-Plugins → Eingeschränkten Modus ausschalten.
 2. Den Ordner `claude-markdown-viewer` (mit `main.js`, `manifest.json`, `styles.css`) nach `<Vault>/.obsidian/plugins/` kopieren. Der Ordner `.obsidian` ist im Finder versteckt: Cmd + Shift + Punkt zeigt ihn.
 3. Obsidian neu laden (Befehlspalette → „Reload app without saving“) oder neu starten.
-4. Einstellungen → Community-Erweiterungen → „Claude Markdown Viewer“ einschalten.
+4. Einstellungen → Community-Plugins → „Claude Markdown Viewer“ einschalten.
 
 Ein Update geht genauso: die drei Dateien im Ordner ersetzen, Obsidian neu laden.
 
-## Zwei Darstellungen: wie Claude oder Norm
+## Was das Plugin darstellt
 
-| Element | Wie Claude: Docs-Export | Wie Claude: Chat und Claude Code | Norm (wie GitHub) |
-| --- | --- | --- | --- |
-| Code-Block `latex` | Formel | Code | Code |
-| Code-Block `math` | Formel | Formel | Formel |
-| Code-Block `csv`, `tsv` | Tabelle | Text | Text |
-| Code-Block `markdown`, `md` | gerenderte Vorschau | Quelltext | Quelltext |
-| `\(…\)` und `\[…\]` | Text (im Export sind das maskierte Klammern) | Formel | Text |
-| einfacher Zeilenumbruch ohne Leerzeile | neue Zeile | neue Zeile | Leerzeichen, die Zeilen bilden einen Absatz |
+Was Obsidian selbst kann (`$…$`, `$$…$$`, Tabellen, Mermaid, Hinweisboxen, Fußnoten, Bilder in Markdown-Syntax, Links), bleibt Obsidians Darstellung. Dazu kommt:
 
-In allen drei Fällen gleich: `$…$` und `$$…$$`, Mermaid-Diagramme, Hinweisboxen, Fußnoten, Tabellen, `<details>` als Klappbereich, harte Zeilenumbrüche (zwei Leerzeichen, `\` oder `<br>` am Zeilenende).
-
-„Wie Claude“ ist voreingestellt. Ob eine Datei ein Docs-Export ist, erkennt das Plugin an der Datumszeile unter dem Titel („Nov 17, 2026 · @Name“) und an Diagramm-Platzhaltern. Zuverlässiger ist ein fester Ordner für Docs-Exporte in den Einstellungen.
-
-So schaltest du um:
-
-- **Alle Dateien:** Einstellungen → Claude Markdown Viewer → „Standard-Darstellung“ und „Einfache Zeilenumbrüche“.
-- **Eine Datei:** Augen-Symbol oben rechts in der Datei, oder Befehl „Darstellung dieser Datei wählen …“. Zur Wahl stehen Automatisch, wie Claude Docs, wie Claude-Chat und Claude Code, Norm, und getrennt oder zusammen für die Zeilenumbrüche. Die Wahl steht in den Plugin-Daten, nicht in der Datei, und bleibt beim Umbenennen erhalten.
-- **Ein Block:** Umschalter oben rechts am Block (Formel oder Code, Tabelle oder Text) bzw. die Reiter „Vorschau“ und „Quelltext“. Das gilt nur, bis die Datei neu dargestellt wird.
-
-Die Obsidian-Einstellung „Strenge Zeilenumbrüche“ musst du nicht ändern. Das Plugin liest sie und gleicht in der Leseansicht selbst aus.
-
-## Weitere Funktionen, in jeder Darstellung
-
-| Element | Darstellung mit Plugin |
+| In der Datei | Darstellung |
 | --- | --- |
-| `<details>` | Klappbereich mit vollem Markdown, auch mit Leerzeilen, verschachtelt und in Listen. Erkannt, wenn `<details>` allein oder mit `<summary>` auf der Zeile steht; Fließtext wie „`<details>` ist ein HTML-Element“ bleibt Text. |
-| `%%…%%` | Text. Obsidian blendet Text zwischen zwei `%%` als Kommentar aus. Ein einzelnes `%%` (etwa „50 %%“) zeigt die Leseansicht ohnehin als Text. |
-| `#wort` | Text statt Obsidian-Tag (etwa `#include` oder `#ff0000`) |
-| `==wort==` | Text bei Chat/Code und Norm; Markierung bei Docs-Exporten |
-| `[embedded content: …]` | Hinweiskasten: Diagramm fehlt im Docs-Export |
+| Code-Block `latex`, `math` | Formel. Ein ganzes LaTeX-Dokument (`\documentclass` …) kann Obsidian nicht setzen; es bleibt Quelltext mit Hinweis. |
+| Code-Block `csv`, `tsv` | Tabelle, Zahlenspalten rechtsbündig |
+| Code-Block `markdown`, `md` | dargestelltes Beispiel im Rahmen |
+| Code-Block `svg` | Grafik |
+| `\(…\)` und `\[…\]` | Formel. Maskierte Klammern wie `\[1\]` oder `\[\[Wikilink\]\]` bleiben Text. |
+| `<details>` | Klappbereich mit vollem Markdown, auch mit Leerzeilen, verschachtelt und in Listen. Erkannt, wenn `<details>` allein oder mit `<summary>` auf der Zeile steht. |
+| Docs-Export: `\<u>`, `\<sub>`, `\<sup>`, `\<details>` usw. | die Formatierung (unterstrichen, H₂O, x², Klappbereich) statt der maskierten Tags |
+| Docs-Export: `> &#91;!NOTE\]` | Hinweisbox |
+| Docs-Export: `[embedded content: …]` | Hinweiskasten: Diagramm oder Chart fehlt im Export |
+| `%%…%%` | Text statt Obsidian-Kommentar (Claude kennt diese Syntax nicht) |
+| `<img src="bilder/a.png">` | Bild; der Pfad wird relativ zur Datei im Vault gesucht |
 | `[Text](#github-anker)` | Sprung zur passenden Überschrift, auch in andere Dateien und in Klappbereiche |
-| Hinweisboxen `> [!IMPORTANT]`, `> [!CAUTION]` | GitHub-Farben |
+| Fußnoten in umgebauten Abschnitten | `[1]` wie bei Obsidian; Tippen springt zur Fußnote |
+| Hinweisboxen `> [!IMPORTANT]`, `> [!CAUTION]` | GitHub-Farben (violett, rot) |
 | breite Tabellen | horizontal scrollbar |
-| `www.`-Adressen | Link (aktuelle Obsidian-Versionen tun das selbst; das Plugin ergänzt es nur, wo es fehlt) |
-| Fußnoten in umgebauten Abschnitten | `[1]` wie bei Obsidian; Tippen springt zur Fußnote am Ende (Tooltip gibt es auf dem iPad nicht) |
-
-Jede dieser Funktionen lässt sich in den Einstellungen abschalten, `%%`, `#wort` und `==wort==` gemeinsam.
 
 ## Nur ansehen
 
-- Markdown-Dateien öffnen immer in der Leseansicht. Ein Wechsel in den Bearbeitungsmodus wird sofort zurückgenommen. Abschalten geht nur in den Einstellungen; einen Befehl zum Bearbeiten gibt es nicht.
-- Eigenschaften (Frontmatter) sind sichtbar, aber nicht änderbar, auch nicht per Tastatur. Links darin und das Ein- und Ausklappen funktionieren.
+Eine Einstellung, „Nur ansehen“, voreingestellt an:
+
+- Markdown-Dateien öffnen immer in der Leseansicht. Ein Wechsel in den Bearbeitungsmodus wird sofort zurückgenommen.
+- Eigenschaften (Frontmatter) sind sichtbar, aber nicht änderbar, auch nicht per Tastatur.
 - Checkboxen lassen sich weder anklicken noch mit der Leertaste umschalten.
-- Ein Link zu einer fehlenden Datei legt keine Notiz an, weder per Klick noch über das Kontextmenü. Stattdessen erscheint ein Hinweis.
-- CSV-Tabellen und alle anderen Ansichten sind reine Anzeige: kein Bearbeiten, kein Sortieren, kein Speichern.
+- Ein Link zu einer fehlenden Datei legt keine Notiz an, weder per Klick noch über das Kontextmenü.
 
-## Befehle
-
-In der Befehlspalette (Cmd + P), Präfix „Claude Markdown Viewer“:
-
-- Darstellung dieser Datei wählen …
-- Diese Datei: Norm oder wie Claude
-- Diese Datei: Zeilenumbrüche getrennt oder zusammen
-- Alle offenen Dateien neu darstellen
+Zum ausnahmsweisen Bearbeiten in Obsidian die Einstellung ausschalten.
 
 ## Grenzen
 
 - Charts und Diagramme aus Claude Docs fehlen schon im Markdown-Export. Das Plugin zeigt dort einen Hinweis.
-- Klappbereiche, `\(…\)` und Zeilenumbrüche werden nur in der Leseansicht umgebaut, nicht in eingebetteten Notizen (`![[…]]`) und Hover-Vorschauen. Dort gilt die Obsidian-Einstellung „Strenge Zeilenumbrüche“.
-- Wie Claude im Chat einfache Zeilenumbrüche sowie `latex`- und `csv`-Blöcke zeigt, ist nicht dokumentiert. Die Voreinstellung beruht auf Beobachtung, deshalb ist alles umschaltbar.
+- Ganze LaTeX-Dokumente lassen sich ohne LaTeX-Programm nicht setzen.
+- Klappbereiche, `\(…\)` und maskierte Tags werden nur in der Leseansicht umgebaut, nicht in eingebetteten Notizen (`![[…]]`) und Hover-Vorschauen.
+- Ein Docs-Export maskiert Formatierungen und wörtlich getippte Tags gleich. Das Plugin stellt beide als Formatierung dar.
+- Einfache Zeilenumbrüche regelt Obsidians Einstellung „Strenge Zeilenumbrüche“. Aus (Standard) zeigt Zeilen wie Claude untereinander.
+- Belegt ein anderes Plugin die Code-Blöcke `latex`, `math`, `csv`, `tsv`, `markdown`, `md` oder `svg`, meldet das Plugin das beim Start und lässt diese Blöcke aus.
+- Ein Link aus einer anderen Datei auf eine Überschrift in einem Klappbereich landet am Anfang des Bereichs.
+- `<details>` wird nur erkannt, wenn es höchstens drei Leerzeichen eingerückt ist. In tiefer verschachtelten Listen und in Zitaten (`> <details>`) bleibt es, wie Obsidian es zeigt.
+- Eingerückte Code-Blöcke (vier Leerzeichen statt ```` ``` ````) schützt das Plugin nicht: `\(…\)`, maskierte Tags und `%%` werden dort mit umgebaut.
 - Nicht zusammen mit „LaTeX Delimiter Renderer“ oder „Details Markdown“ verwenden: beide machen Teile davon und würden doppelt eingreifen.
-- Belegt ein anderes Plugin die Code-Blöcke `latex`, `math`, `csv`, `tsv`, `markdown` oder `md`, meldet das Plugin das beim Start und lässt diese Blöcke aus. Der Rest funktioniert weiter.
-- Ein Docs-Export maskiert Text, den Claude Docs wörtlich zeigt, etwa `\<u>…\</u>` oder `&#91;!NOTE\]`. Das Plugin zeigt ihn deshalb ebenfalls als Text.
-- Ein Klappbereich oder ein `%%`-Bereich wird als ein Stück dargestellt. Ein Link aus einer anderen Datei auf eine Überschrift darin landet am Anfang des Bereichs, nicht genau bei der Überschrift.
 
 ## Änderungen
+
+**2.0.1**
+
+- Behoben: Ein Ankerlink auf eine Überschrift in einem maskierten Klappbereich aus einem Docs-Export (`\<details>`) sprang in den ausgeblendeten Abschnitt.
+- Behoben: Fußnoten-Nummern zählten Verweise ohne Definition mit (`[^x]` ohne `[^x]:`); danach stimmten Nummer und Sprungziel nicht.
+- Behoben: Code-Block `svg` mit `<!DOCTYPE svg …>` erschien als Code statt als Grafik. Fehlte `xmlns` am `<svg>`-Tag, stand aber weiter innen oder in einem Kommentar davor, blieb das Bild leer.
+- Schneller bei großen Dateien ohne Umbau: Der Schnelltest läuft einmal je Datei statt einmal je Abschnitt.
+
+**2.0.0**
+
+- Nur noch eine Darstellung: alles immer fertig dargestellt. Entfernt: „wie Claude Docs“, „wie Claude-Chat“, „Norm“, das Augen-Symbol, die Befehle, die Umschalter an Formel-, CSV- und Markdown-Blöcken und die Docs-Erkennung.
+- Neu: maskierte Formatierungen aus Docs-Exporten (`\<u>`, `\<sub>`, `\<sup>`, `\<details>` …) und `> &#91;!NOTE\]` werden dargestellt.
+- Neu: `<img>` mit relativem Pfad zeigt das Bild; Code-Block `svg` zeigt die Grafik.
+- Entfernt, weil Obsidian es selbst kann oder es Obsidian-Formatierung ist: eigene Zeilenumbruch-Logik, `www.`-Verlinkung, Tags und `==Markierung==` als Text.
+- Einstellungen: nur noch „Nur ansehen“ (übernimmt den bisherigen Wert von „Immer Leseansicht“).
 
 **1.2.1**
 

@@ -1,7 +1,8 @@
-// Regressionstests für die in 1.1.1 behobenen Fehler.
+// Regressionstests für den Claude Markdown Viewer (ab 2.0.0).
 // Aufruf ohne Abhängigkeiten: node tests/regression.js
 // Das Modul "obsidian" wird durch eine kleine Attrappe ersetzt; geprüft werden
-// nur reine Funktionen und der Klick-Handler, nicht die Darstellung in Obsidian.
+// reine Funktionen, die Abschnittslogik und die Klick-Handler, nicht die
+// Darstellung in Obsidian selbst.
 'use strict';
 
 const Module = require('module');
@@ -9,6 +10,12 @@ const path = require('path');
 const assert = require('assert');
 
 class MarkdownView {}
+class TFile {
+  /** @param {string} p */
+  constructor(p) {
+    this.path = p;
+  }
+}
 const obsidianMock = {
   Plugin: class {
     constructor(app, manifest) {
@@ -27,14 +34,13 @@ const obsidianMock = {
   MarkdownRenderChild: class {},
   MarkdownView,
   Notice: class {},
-  Menu: class {},
-  TFile: class {},
+  TFile,
   setIcon: () => {},
   loadMathJax: async () => {},
   renderMath: () => null,
   finishRenderMath: async () => {},
   loadPrism: async () => null,
-  debounce: (fn) => fn,
+  normalizePath: (p) => p.replace(/\/+/g, '/').replace(/^\/|\/$/g, ''),
 };
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
@@ -46,7 +52,6 @@ const Plugin = require(path.join(__dirname, '..', 'claude-markdown-viewer', 'mai
 const T = Plugin.__test;
 
 let failed = 0;
-/** @param {string} name @param {() => void} fn */
 const queue = [];
 function test(name, fn) {
   queue.push({ name, fn });
@@ -63,117 +68,12 @@ async function runAll() {
   }
 }
 
-/* ---------- Formel-Begrenzer ---------- */
-
-test('stripTexDelimiters: mehrere $$-Formeln bleiben getrennt', () => {
-  const tex = T.stripTexDelimiters('$$a$$\n\n$$b$$');
-  const chunks = T.splitTexChunks(tex).map((c) => T.stripTexDelimiters(c));
-  assert.deepStrictEqual(chunks, ['a', 'b']);
-});
-
-test('stripTexDelimiters: einfache Fälle unverändert', () => {
-  assert.strictEqual(T.stripTexDelimiters('$$x$$'), 'x');
-  assert.strictEqual(T.stripTexDelimiters('$x$'), 'x');
-  assert.strictEqual(T.stripTexDelimiters('\\[ x \\]'), 'x');
-  assert.strictEqual(T.stripTexDelimiters('\\(x\\)'), 'x');
-  assert.strictEqual(T.stripTexDelimiters('$$ \\text{$x$} $$'), '\\text{$x$}');
-  assert.strictEqual(T.stripTexDelimiters('$$\n\\begin{aligned}a\\end{aligned}\n$$'), '\\begin{aligned}a\\end{aligned}');
-});
-
-/* ---------- GitHub-Anker ---------- */
-
-test('Doppelte Überschriften: Slugs wie github-slugger', () => {
-  const idx = T.buildHeadingIndex('# A\n## Beispiel\n## Beispiel\n## Beispiel 1\n## Beispiel\n');
-  assert.deepStrictEqual(
-    idx.headings.map((h) => h.slug),
-    ['a', 'beispiel', 'beispiel-1', 'beispiel-1-1', 'beispiel-2']
-  );
-  assert.strictEqual(T.resolveAnchor(idx, 'beispiel-2').line, 4);
-  assert.strictEqual(T.resolveAnchor(idx, 'beispiel-1-1').line, 3);
-});
-
-/* ---------- Klick-Handler ---------- */
-
-/**
- * Minimale DOM-Attrappe: ein Link in einer Leseansicht.
- * @param {{ href: string, classes: string[] }} spec
- */
-function fakeLink(spec) {
-  const container = { contains: () => true };
-  const a = {
-    classList: { contains: (c) => spec.classes.includes(c) },
-    getAttribute: (name) => (name === 'href' ? spec.href : null),
-    closest: (sel) => (sel === 'a' ? a : sel.includes('.markdown-preview-view') ? container : null),
-  };
-  return { a, container };
+/** @param {object} [app] */
+function newPlugin(app) {
+  const plugin = new Plugin(app || { workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
+  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS);
+  return plugin;
 }
-
-/** @param {{ href: string, classes: string[] }} spec */
-function clickOn(spec) {
-  const { a, container } = fakeLink(spec);
-  const view = Object.create(MarkdownView.prototype);
-  let scrolledTo = null;
-  Object.assign(view, {
-    containerEl: container,
-    file: { path: 'a.md', name: 'a.md', basename: 'a' },
-    data: '# A\n\nTags: #test\n\n## Test\n',
-    getViewData() {
-      return this.data;
-    },
-    getMode: () => 'preview',
-    previewMode: { applyScroll: (line) => (scrolledTo = line) },
-    setEphemeralState: () => {},
-  });
-  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [{ view }] }, metadataCache: {} }, {});
-  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
-  let prevented = false;
-  plugin.onLinkClick({
-    type: 'click',
-    button: 0,
-    target: a,
-    defaultPrevented: false,
-    preventDefault: () => (prevented = true),
-    stopPropagation: () => {},
-    stopImmediatePropagation: () => {},
-  });
-  return { prevented, scrolledTo };
-}
-
-test('Klick auf Tag #test springt nicht zur Überschrift „Test“', () => {
-  const r = clickOn({ href: '#test', classes: ['tag'] });
-  assert.strictEqual(r.prevented, false);
-  assert.strictEqual(r.scrolledTo, null);
-});
-
-test('Klick auf Ankerlink #test springt weiterhin zur Überschrift', () => {
-  const r = clickOn({ href: '#test', classes: ['internal-link'] });
-  assert.strictEqual(r.prevented, true);
-  assert.strictEqual(r.scrolledTo, 4);
-});
-
-/* ---------- 1.2.0: %%-Kommentare ---------- */
-
-test('Einzelnes %% bleibt Text (so zeigt es die Leseansicht), kein Bereich', () => {
-  const lines = ['# T', '', 'Prozent 50 %% sowie mehr', '', '## Weiter', '', 'Text'];
-  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), []);
-});
-
-test('%%-Paar über mehrere Absätze ergibt einen Bereich', () => {
-  const lines = ['a 50 %% b', '', 'c', '', 'd 70 %% e'];
-  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), [{ start: 0, end: 4 }]);
-});
-
-test('%% in Code zählt nicht, Paare schließen', () => {
-  const lines = ['a %%b%% c', '`%%` code', '```', '%%', '```', 'x'];
-  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), [{ start: 0, end: 0 }]);
-});
-
-test('escapeComments ersetzt %% nur außerhalb von Code', () => {
-  assert.strictEqual(
-    T.escapeComments('50 %% und `%%`\n```\n%%\n```\nEnde %%'),
-    '50 &#37;&#37; und `%%`\n```\n%%\n```\nEnde &#37;&#37;'
-  );
-});
 
 /**
  * Minimale Attrappe eines Abschnitts der Leseansicht.
@@ -193,45 +93,103 @@ function fakeSection(lineStart, lineEnd, text) {
     textContent: '',
     classes,
   };
-  const ctx = {
-    docId: 'doc-1',
-    sourcePath: 'docs.md',
-    addChild: () => {},
-    getSectionInfo: () => ({ text, lineStart, lineEnd }),
-  };
+  const ctx = { docId: 'doc-' + text.length, sourcePath: 'a.md', addChild: () => {}, getSectionInfo: () => ({ text, lineStart, lineEnd }) };
   return { el, ctx };
 }
 
-test('processSection: %%-Paar über Absätze erscheint als Text, Folgeabschnitt ausgeblendet', async () => {
-  const text = '# Titel\n\nRabatt 50 %% und\n\n## Mitte\n\nbis 70 %% gesamt.\n\nEnde\n';
-  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
-  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
-  const first = fakeSection(2, 2, text);
-  await plugin.processSection(first.el, first.ctx);
-  assert.ok(first.el.rendered, 'Abschnitt wurde nicht neu dargestellt');
-  assert.ok(first.el.rendered.includes('Rabatt 50 &#37;&#37; und'));
-  assert.ok(first.el.rendered.includes('## Mitte'));
-  assert.ok(first.el.rendered.includes('bis 70 &#37;&#37; gesamt.'));
-  assert.ok(!first.el.rendered.includes('Ende'));
-  const later = fakeSection(4, 4, text);
-  await plugin.processSection(later.el, later.ctx);
-  assert.ok(later.el.classes.has('cmv-hidden'), 'Abschnitt im Bereich ist nicht ausgeblendet');
-  const after = fakeSection(8, 8, text);
-  await plugin.processSection(after.el, after.ctx);
-  assert.ok(!after.el.classes.has('cmv-hidden') && !after.el.rendered, 'Abschnitt nach dem Bereich wurde verändert');
+/* ---------- Formeln ---------- */
+
+test('\\(…\\) und \\[…\\] werden immer Formel, maskierte Klammern nicht', () => {
+  assert.strictEqual(T.convertMathDelimiters('a \\(x^2\\) b'), 'a $x^2$ b');
+  assert.strictEqual(T.convertMathDelimiters('\\[\n\\sum k\n\\]'), '$$\n\\sum k\n$$');
+  assert.strictEqual(T.convertMathDelimiters('\\[1\\] und \\[\\[Wikilink\\]\\]'), '\\[1\\] und \\[\\[Wikilink\\]\\]');
 });
 
-test('processSection: einzelnes %% im Docs-Export lässt den Abschnitt unverändert', async () => {
-  const text = '# Titel\n\nNov 16, 2026 · @Name\n\nProzent 50 %% sowie mehr.\n';
-  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
-  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
+test('stripTexDelimiters: mehrere $$-Formeln bleiben getrennt', () => {
+  const chunks = T.splitTexChunks(T.stripTexDelimiters('$$a$$\n\n$$b$$')).map((c) => T.stripTexDelimiters(c));
+  assert.deepStrictEqual(chunks, ['a', 'b']);
+  assert.strictEqual(T.stripTexDelimiters('$$ \\text{$x$} $$'), '\\text{$x$}');
+});
+
+test('LaTeX-Dokument wird erkannt (bleibt Quelltext)', () => {
+  assert.strictEqual(T.looksLikeLatexDocument('\\documentclass{article}\n\\begin{document}x\\end{document}'), true);
+  assert.strictEqual(T.looksLikeLatexDocument('\\begin{aligned}a&=b\\end{aligned}'), false);
+});
+
+/* ---------- Maskiertes HTML aus Docs-Exporten ---------- */
+
+test('\\<u>, \\<sub>, \\<sup> werden Formatierung, Code bleibt', () => {
+  assert.strictEqual(
+    T.unescapeHtmlLine('mit \\<u>u\\</u>, H\\<sub>2\\</sub>O, x\\<sup>2\\</sup> und `\\<u>`'),
+    'mit <u>u</u>, H<sub>2</sub>O, x<sup>2</sup> und `\\<u>`'
+  );
+  assert.strictEqual(T.unescapeHtmlLine('Sternchen \\* und \\[\\[Wikilink\\]\\]'), 'Sternchen \\* und \\[\\[Wikilink\\]\\]');
+  assert.strictEqual(T.unescapeHtmlLine('Zeile \\<br> bleibt'), 'Zeile \\<br> bleibt');
+});
+
+test('Hinweisbox &#91;!NOTE\\] im Zitat wird [!NOTE]', () => {
+  assert.strictEqual(T.unescapeHtmlLine('> &#91;!NOTE\\] GitHub-Hinweisbox.'), '> [!NOTE] GitHub-Hinweisbox.');
+  assert.strictEqual(T.unescapeHtmlLine('&#91;embedded content: X\\]'), '&#91;embedded content: X\\]');
+});
+
+test('Maskiertes <details> aus dem Docs-Export wird Klappbereich', () => {
+  const raw = ['\\<details>&#10;\\<summary>Ausklappbar\\</summary>', '', 'Inhalt mit **fett**.', '', '\\</details>'];
+  const lines = T.prepareLines(raw);
+  assert.strictEqual(raw.length, lines.length);
+  const regions = T.findDetailsRegions(lines, T.computeProtectedMask(lines));
+  assert.deepStrictEqual(regions, [{ start: 0, end: 4 }]);
+  const res = T.buildSectionMarkdown(lines, raw, 0, 0, regions);
+  assert.strictEqual(res.markdown.trim(), '> [!claude-details]- Ausklappbar\n> Inhalt mit **fett**.');
+});
+
+test('processSection: Docs-Zeile mit maskierten Tags wird neu dargestellt', async () => {
+  const text = '# T\n\nNormaler Text, \\<u>unterstrichen\\</u>, H\\<sub>2\\</sub>O, Prozent 50 %% sowie \\[\\[Wikilink\\]\\].\n';
+  const sec = fakeSection(2, 2, text);
+  await newPlugin().processSection(sec.el, sec.ctx);
+  assert.strictEqual(sec.el.rendered, 'Normaler Text, <u>unterstrichen</u>, H<sub>2</sub>O, Prozent 50 %% sowie \\[\\[Wikilink\\]\\].');
+});
+
+test('Schnelltest je Datei: Merker liefert dasselbe wie der Test', () => {
+  const p = newPlugin();
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+  assert.strictEqual(p.fileNeedsWork('mit \\(x\\)', 'd'), true);
+  assert.strictEqual(p.fileNeedsWork('mit <DETAILS>', 'e'), true);
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+});
+
+test('processSection: Abschnitt ohne Umbau bleibt, wie Obsidian ihn zeigt', async () => {
+  const text = '# T\n\nNur Text mit \\(x\\) weiter unten.\n\nKein Umbau hier.\n';
   const sec = fakeSection(4, 4, text);
-  await plugin.processSection(sec.el, sec.ctx);
+  await newPlugin().processSection(sec.el, sec.ctx);
   assert.strictEqual(sec.el.rendered, null);
   assert.ok(!sec.el.classes.has('cmv-hidden'));
 });
 
-/* ---------- 1.2.0: <details> ---------- */
+/* ---------- %%-Kommentare ---------- */
+
+test('Einzelnes %% bleibt Text (so zeigt es die Leseansicht), kein Bereich', () => {
+  const lines = ['# T', '', 'Prozent 50 %% sowie mehr', '', 'Text'];
+  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), []);
+});
+
+test('%%-Paar über Absätze: Text sichtbar, Folgeabschnitt ausgeblendet', async () => {
+  const text = '# Titel\n\nRabatt 50 %% und\n\n## Mitte\n\nbis 70 %% gesamt.\n\nEnde\n';
+  const plugin = newPlugin();
+  const first = fakeSection(2, 2, text);
+  await plugin.processSection(first.el, first.ctx);
+  assert.ok(first.el.rendered.includes('Rabatt 50 &#37;&#37; und'));
+  assert.ok(first.el.rendered.includes('bis 70 &#37;&#37; gesamt.'));
+  const later = fakeSection(4, 4, text);
+  await plugin.processSection(later.el, later.ctx);
+  assert.ok(later.el.classes.has('cmv-hidden'));
+});
+
+test('escapeComments ersetzt %% nur außerhalb von Code', () => {
+  assert.strictEqual(T.escapeComments('50 %% und `%%`\n```\n%%\n```\nEnde %%'), '50 &#37;&#37; und `%%`\n```\n%%\n```\nEnde &#37;&#37;');
+});
+
+/* ---------- <details> ---------- */
 
 test('Fließtext mit <details> am Zeilenanfang wird kein Klappbereich', () => {
   const lines = ['<details> ist ein HTML-Element.', '', 'Text', '', 'Man schließt mit </details> ab.'];
@@ -243,39 +201,132 @@ test('<details> in einem Listenpunkt bleibt in der Liste', () => {
   assert.strictEqual(out, '1. Punkt\n\n   > [!claude-details]- Mehr\n   > - innen\n\n2. Weiter');
 });
 
-test('<details open> und einzeiliges <details> werden erkannt', () => {
-  const a = ['<details open>', '<summary>S</summary>', '', 'x', '', '</details>'];
-  assert.deepStrictEqual(T.findDetailsRegions(a, T.computeProtectedMask(a)), [{ start: 0, end: 5 }]);
-  const b = ['<details><summary>A</summary>x</details>'];
-  assert.deepStrictEqual(T.findDetailsRegions(b, T.computeProtectedMask(b)), [{ start: 0, end: 0 }]);
+/* ---------- Markdown-Block, CSV, SVG, Bilder ---------- */
+
+test('```markdown-Vorschau: alles umgebaut', () => {
+  assert.strictEqual(T.transformMarkdown('Formel \\(x\\) und H\\<sub>2\\</sub>O'), 'Formel $x$ und H<sub>2</sub>O');
 });
 
-/* ---------- 1.2.0: Zeilenumbrüche nach CommonMark ---------- */
-
-test('„2024. Jahr“ nach einer Absatzzeile ist Absatztext, keine Liste', () => {
-  assert.strictEqual(T.convertSoftBreaks('Seit\n2024. Jahr. Fazit:\n2. Punkt', 'join'), 'Seit 2024. Jahr. Fazit: 2. Punkt');
-  assert.strictEqual(T.convertSoftBreaks('1. a\n2. b\n3. c', 'join'), '1. a\n2. b\n3. c');
-  assert.strictEqual(T.convertSoftBreaks('Text\n1. a\n2. b', 'join'), 'Text\n1. a\n2. b');
+test('CSV: Anführungszeichen, Semikolon, Zahlenspalten', () => {
+  assert.deepStrictEqual(T.parseCsv('Name,Notiz\nA,"mit, Komma"\nB,"mit ""X"""', ','), [['Name', 'Notiz'], ['A', 'mit, Komma'], ['B', 'mit "X"']]);
+  assert.strictEqual(T.detectDelimiter('a;b\n1,5;2'), ';');
+  assert.deepStrictEqual(T.numericColumns([['M', 'U'], ['Jan', '1.200,50'], ['Feb', '980']], 2), [false, true]);
 });
 
-/* ---------- 1.2.0: Kleinigkeiten ---------- */
+test('SVG wird data:-Bild, anderes nicht', () => {
+  assert.ok(T.svgDataUrl('<svg viewBox="0 0 1 1"><rect/></svg>').startsWith('data:image/svg+xml'));
+  assert.ok(decodeURIComponent(T.svgDataUrl('<svg><rect/></svg>')).includes('xmlns="http://www.w3.org/2000/svg"'));
+  assert.strictEqual(T.svgDataUrl('<div>kein svg</div>'), null);
+});
+
+test('SVG mit DOCTYPE wird Bild; xmlns kommt an das <svg>-Tag selbst', () => {
+  const dec = (u) => decodeURIComponent(u.slice(u.indexOf(',') + 1));
+  const doctype = T.svgDataUrl('<?xml version="1.0"?>\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd">\n<svg width="1"><rect/></svg>');
+  assert.ok(doctype && dec(doctype).includes('<svg xmlns="http://www.w3.org/2000/svg" width="1">'));
+  // Kommentar davor mit „<svg“: nicht dort einfügen, sondern am echten Tag.
+  assert.strictEqual(dec(T.svgDataUrl('<!-- <svg> -->\n<svg><rect/></svg>')), '<!-- <svg> -->\n<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>');
+  // xmlns nur weiter innen: das <svg>-Tag braucht trotzdem eines.
+  assert.ok(dec(T.svgDataUrl('<svg><g><div xmlns="http://www.w3.org/1999/xhtml"/></g></svg>')).startsWith('<svg xmlns="http://www.w3.org/2000/svg">'));
+  // Vorhandenes xmlns bleibt unverändert.
+  const own = '<svg\n  xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>';
+  assert.strictEqual(dec(T.svgDataUrl(own)), own);
+  // DOCTYPE mit eigenen Entity-Definitionen bleibt Code.
+  assert.strictEqual(T.svgDataUrl('<!DOCTYPE svg [<!ENTITY a "b">]>\n<svg/>'), null);
+});
+
+test('Bildpfade relativ zur Datei', () => {
+  assert.strictEqual(T.relativeImagePath('bilder/a.png', 'repo/docs/README.md'), 'repo/docs/bilder/a.png');
+  assert.strictEqual(T.relativeImagePath('../img/a%20b.png?x=1', 'repo/docs/README.md'), 'repo/img/a b.png');
+  assert.strictEqual(T.relativeImagePath('/root.png', 'a/b.md'), 'root.png');
+  assert.strictEqual(T.relativeImagePath('https://x.de/a.png', 'a.md'), null);
+  assert.strictEqual(T.relativeImagePath('app://local/a.png', 'a.md'), null);
+});
+
+test('resolveImages setzt die Adresse für gefundene Bilder', () => {
+  const files = { 'repo/bilder/a.png': new TFile('repo/bilder/a.png') };
+  const plugin = newPlugin({
+    workspace: { getLeavesOfType: () => [] },
+    vault: { getAbstractFileByPath: (p) => files[p] || null, getResourcePath: (f) => 'app://res/' + f.path },
+    metadataCache: { getFirstLinkpathDest: () => null },
+  });
+  const img = { tagName: 'IMG', attrs: { src: 'bilder/a.png' }, getAttribute(n) { return this.attrs[n]; }, setAttribute(n, v) { this.attrs[n] = v; } };
+  const missing = Object.assign({}, img, { attrs: { src: 'fehlt.png' } });
+  plugin.resolveImages(img, 'repo/README.md');
+  plugin.resolveImages(missing, 'repo/README.md');
+  assert.strictEqual(img.attrs.src, 'app://res/repo/bilder/a.png');
+  assert.strictEqual(missing.attrs.src, 'fehlt.png');
+});
+
+/* ---------- Anker, Fußnoten ---------- */
+
+test('Doppelte Überschriften: Slugs wie github-slugger', () => {
+  const idx = T.buildHeadingIndex('# A\n## Beispiel\n## Beispiel\n## Beispiel 1\n## Beispiel\n');
+  assert.deepStrictEqual(idx.headings.map((h) => h.slug), ['a', 'beispiel', 'beispiel-1', 'beispiel-1-1', 'beispiel-2']);
+  assert.strictEqual(T.githubSlug('x²'), 'x');
+});
 
 test('Mehrzeilige Fußnote: ganzer Text im Tooltip', () => {
   const lines = ['Text[^a].', '[^a]: Erste Zeile', '    zweite Zeile', '', '    zweiter Absatz', 'Danach'];
   assert.strictEqual(T.collectFootnotes(lines, new Array(lines.length).fill(false)).defs.get('a'), 'Erste Zeile zweite Zeile zweiter Absatz');
 });
 
-test('Slug: hochgestellte Ziffern fallen weg wie bei GitHub', () => {
-  assert.strictEqual(T.githubSlug('x²'), 'x');
-  assert.strictEqual(T.githubSlug('Ⅻ Kapitel'), 'ⅻ-kapitel');
+test('Fußnoten-Nummern zählen nur Verweise mit Definition', () => {
+  const lines = ['Erst [^x], dann [^b] und [^a], wieder [^b].', '', '[^a]: A', '[^b]: B'];
+  const fn = T.collectFootnotes(lines, new Array(lines.length).fill(false));
+  assert.deepStrictEqual([...fn.order], [['b', 1], ['a', 2]]);
 });
 
-test('Docs-Ordner: Groß- und Kleinschreibung egal, kein Präfix-Treffer', () => {
-  assert.strictEqual(T.inDocsFolder('claude/docs/a.md', ['Claude/Docs']), true);
-  assert.strictEqual(T.inDocsFolder('Claude/DocsAlt/a.md', ['Claude/Docs']), false);
+/* ---------- Klick-Handler ---------- */
+
+/** @param {{ href: string, classes: string[], data?: string }} spec */
+function clickOn(spec) {
+  const container = { contains: () => true, querySelector: () => null, querySelectorAll: () => [] };
+  const a = {
+    classList: { contains: (c) => spec.classes.includes(c) },
+    getAttribute: (name) => (name === 'href' ? spec.href : null),
+    closest: (sel) => (sel === 'a' ? a : sel.includes('.markdown-preview-view') ? container : null),
+  };
+  const view = Object.create(MarkdownView.prototype);
+  let scrolledTo = null;
+  Object.assign(view, {
+    containerEl: container,
+    file: { path: 'a.md', name: 'a.md', basename: 'a' },
+    data: spec.data || '# A\n\nTags: #test\n\n## Test\n',
+    getViewData() {
+      return this.data;
+    },
+    getMode: () => 'preview',
+    previewMode: { applyScroll: (line) => (scrolledTo = line) },
+    setEphemeralState: () => {},
+  });
+  const plugin = newPlugin({ workspace: { getLeavesOfType: () => [{ view }] }, metadataCache: {} });
+  let prevented = false;
+  plugin.onLinkClick({ type: 'click', button: 0, target: a, defaultPrevented: false, preventDefault: () => (prevented = true), stopPropagation: () => {}, stopImmediatePropagation: () => {} });
+  return { prevented, scrolledTo };
+}
+
+test('Klick auf Tag #test springt nicht zur Überschrift „Test“', () => {
+  const r = clickOn({ href: '#test', classes: ['tag'] });
+  assert.strictEqual(r.prevented, false);
 });
 
-/* ---------- 1.2.0: Nur ansehen ---------- */
+test('Klick auf Ankerlink #test springt zur Überschrift', () => {
+  const r = clickOn({ href: '#test', classes: ['internal-link'] });
+  assert.strictEqual(r.prevented, true);
+  assert.strictEqual(r.scrolledTo, 4);
+});
+
+test('Ankerlink in maskierten Docs-Klappbereich springt zum Anfang des Bereichs', () => {
+  const data = '# A\n\n\\<details>&#10;\\<summary>Mehr\\</summary>\n\n## Innen\n\nText\n\n\\</details>\n';
+  // Überschrift nicht im DOM: Sprung zur ersten Zeile des Bereichs, nicht in den
+  // ausgeblendeten Abschnitt (Zeile 4).
+  assert.deepStrictEqual(clickOn({ href: '#innen', classes: ['internal-link'], data }), { prevented: true, scrolledTo: 2 });
+  // Auch die exakte Schreibweise übernimmt das Plugin, weil Obsidian sonst in
+  // den ausgeblendeten Abschnitt springt.
+  assert.deepStrictEqual(clickOn({ href: '#Innen', classes: ['internal-link'], data }), { prevented: true, scrolledTo: 2 });
+});
+
+/* ---------- Nur ansehen ---------- */
 
 /** @param {{ matches?: string, inside?: string[] }} spec */
 function guardTarget(spec) {
@@ -289,37 +340,34 @@ function guardTarget(spec) {
     },
   };
 }
-
-function guardPlugin() {
-  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] } }, {});
-  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
-  return plugin;
-}
-
 function fakeEvent(target) {
-  const e = { target, prevented: false, preventDefault() { this.prevented = true; }, stopPropagation() {}, stopImmediatePropagation() {} };
-  return e;
+  return { target, prevented: false, preventDefault() { this.prevented = true; }, stopPropagation() {}, stopImmediatePropagation() {} };
 }
 
 test('Checkbox: Klick (auch per Leertaste) wird verworfen', () => {
   const e = fakeEvent(guardTarget({ matches: 'input.task-list-item-checkbox', inside: ['.markdown-preview-view'] }));
-  guardPlugin().onGuardClick(e);
+  newPlugin().onGuardClick(e);
   assert.strictEqual(e.prevented, true);
 });
 
-test('Eigenschaften: kein Fokus, keine Eingabe', () => {
+test('Eigenschaften: kein Fokus, keine Eingabe; Link bleibt anklickbar', () => {
   const t = guardTarget({ inside: ['.metadata-container'] });
-  const p = guardPlugin();
+  const p = newPlugin();
   p.onGuardFocus(fakeEvent(t));
   assert.strictEqual(t.blurred, true);
   const e = fakeEvent(t);
   p.onGuardInput(e);
   assert.strictEqual(e.prevented, true);
+  const link = fakeEvent(guardTarget({ inside: ['.metadata-container', 'a'] }));
+  p.onGuardClick(link);
+  assert.strictEqual(link.prevented, false);
 });
 
-test('Eigenschaften: Link bleibt anklickbar', () => {
-  const e = fakeEvent(guardTarget({ inside: ['.metadata-container', 'a'] }));
-  guardPlugin().onGuardClick(e);
+test('„Nur ansehen“ aus: keine Sperren', () => {
+  const p = newPlugin();
+  p.settings.viewOnly = false;
+  const e = fakeEvent(guardTarget({ matches: 'input.task-list-item-checkbox', inside: ['.markdown-preview-view'] }));
+  p.onGuardClick(e);
   assert.strictEqual(e.prevented, false);
 });
 

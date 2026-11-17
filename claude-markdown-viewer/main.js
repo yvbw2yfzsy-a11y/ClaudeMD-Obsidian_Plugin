@@ -3,15 +3,16 @@
  * Claude Markdown Viewer
  * ----------------------
  * Zeigt Markdown-Dateien aus Claude Docs (Markdown-Export), Claude-Chats und
- * Claude Code in Obsidian wahlweise so an, wie Claude sie darstellt, oder nach
- * der Norm (Markdown-Standard wie auf GitHub). Umschaltbar als Standard, je
- * Datei (Augen-Symbol) und je Block.
+ * Claude Code in Obsidian immer fertig dargestellt: Formeln, Tabellen,
+ * Klappbereiche, Bilder, Diagramm-Platzhalter. Es gibt nur diese eine
+ * Darstellung; wer den Quelltext sehen will, öffnet die Datei in einem
+ * Texteditor.
  *
  * Reines CommonJS ohne Build-Schritt: main.js, manifest.json und styles.css
  * in <Vault>/.obsidian/plugins/claude-markdown-viewer/ legen und aktivieren.
  * Reiner Viewer: Das Plugin liest Dateien nur, schreibt nie in Notizen und hat
- * keine Bearbeitungsfunktionen. Gespeichert werden nur die eigenen
- * Einstellungen (data.json im Plugin-Ordner).
+ * keine Bearbeitungsfunktionen. Gespeichert wird nur die eigene Einstellung
+ * „Nur ansehen“ (data.json im Plugin-Ordner).
  */
 'use strict';
 
@@ -24,75 +25,23 @@ const {
   MarkdownRenderChild,
   MarkdownView,
   Notice,
-  Menu,
   TFile,
   setIcon,
   loadMathJax,
   renderMath,
   finishRenderMath,
   loadPrism,
-  debounce,
+  normalizePath,
 } = obsidian;
-
-/* ======================================================================
- * Einstellungen
- * ==================================================================== */
-
-/**
- * Standard-Darstellung: wie Claude (Docs-Export oder Chat/Code, automatisch
- * erkannt) oder Norm (Markdown-Standard wie auf GitHub).
- * @typedef {'claude' | 'norm'} RenderMode
- */
-/**
- * Einfache Zeilenumbrüche: getrennt (jede Zeile einzeln) oder zusammen
- * (ein Absatz, wie die Norm).
- * @typedef {'split' | 'join'} BreakMode
- */
-/** @typedef {'auto' | BreakMode} LineBreakMode */
-/**
- * Darstellung einer einzelnen Datei.
- * @typedef {'docs' | 'chat' | 'norm'} FileStyle
- */
-/**
- * Eigene Einstellung einer Datei. Fehlt ein Wert, gilt der Standard.
- * @typedef {{ style?: FileStyle, breaks?: BreakMode }} FileMode
- */
 
 /**
  * @typedef {Object} ViewerSettings
- * @property {boolean} lockReadingView
- * @property {boolean} readOnlyCheckboxes
- * @property {boolean} blockUnresolvedLinks
- * @property {RenderMode} renderMode
- * @property {LineBreakMode} lineBreaks
- * @property {Record<string, FileMode>} fileModes
- * @property {string} docsFolders
- * @property {boolean} renderDetails
- * @property {boolean} githubAnchors
- * @property {boolean} embedPlaceholders
- * @property {boolean} scrollableTables
- * @property {boolean} githubAlertColors
- * @property {boolean} linkifyWww
- * @property {boolean} obsidianSyntaxAsText
+ * @property {boolean} viewOnly Leseansicht erzwingen, Checkboxen, Eigenschaften
+ *   und Links zu fehlenden Dateien sperren.
  */
 
 /** @type {ViewerSettings} */
-const DEFAULT_SETTINGS = {
-  lockReadingView: true,
-  readOnlyCheckboxes: true,
-  blockUnresolvedLinks: true,
-  renderMode: 'claude',
-  lineBreaks: 'auto',
-  fileModes: {},
-  docsFolders: '',
-  renderDetails: true,
-  githubAnchors: true,
-  embedPlaceholders: true,
-  scrollableTables: true,
-  githubAlertColors: true,
-  linkifyWww: true,
-  obsidianSyntaxAsText: true,
-};
+const DEFAULT_SETTINGS = { viewOnly: true };
 
 /** Eigenschaften (Frontmatter) in der Leseansicht und in der Seitenleiste. */
 const PROPERTIES_SELECTOR =
@@ -101,17 +50,11 @@ const PROPERTIES_SELECTOR =
 const LOG_PREFIX = '[Claude Markdown Viewer]';
 const DETAILS_CALLOUT = 'claude-details';
 
-/** @type {FileStyle[]} */
-const FILE_STYLES = ['docs', 'chat', 'norm'];
-
 /**
- * Einfache Zeilenumbrüche, wenn nichts anderes eingestellt ist.
- * Wie Claude: getrennt (so zeigt es auch Obsidian ab Werk, „Strenge
- * Zeilenumbrüche“ aus). Ein Docs-Export enthält einen einfachen Umbruch nur,
- * wenn das Doc dort eine neue Zeile hatte. Norm: zusammen (CommonMark).
- * @type {Record<FileStyle, BreakMode>}
+ * @typedef {{ start: number, end: number }} Region
+ * @typedef {{ text: string, raw: string, line: number, level: number, slug: string }} HeadingEntry
+ * @typedef {{ headings: HeadingEntry[], anchors: Array<{ id: string, line: number }> }} HeadingIndex
  */
-const AUTO_BREAKS = { docs: 'split', chat: 'split', norm: 'join' };
 
 /* ======================================================================
  * Reine Text-Hilfsfunktionen (ohne Obsidian-Abhängigkeit, testbar)
@@ -215,7 +158,8 @@ function findInlineCodeRanges(text) {
 }
 
 /**
- * Entfernt Inline-Code aus einer Zeile (für Tag- und Fußnotensuche).
+ * Entfernt Inline-Code aus einer Zeile (für die Suche nach <details>-Tags,
+ * %% und Fußnoten).
  * @param {string} line
  */
 function stripInlineCode(line) {
@@ -242,6 +186,53 @@ function isEscapedAt(text, index) {
   return n % 2 === 1;
 }
 
+/**
+ * Wendet `fn` nur auf die Teile außerhalb von Inline-Code an; Code bleibt.
+ * @param {string} text
+ * @param {(part: string) => string} fn
+ */
+function mapOutsideInlineCode(text, fn) {
+  let out = '';
+  let last = 0;
+  for (const [a, b] of findInlineCodeRanges(text)) {
+    out += fn(text.slice(last, a)) + text.slice(a, b);
+    last = b;
+  }
+  return out + fn(text.slice(last));
+}
+
+/**
+ * Wendet `fn` auf zusammenhängende Textstücke außerhalb von Code-Blöcken (und
+ * am Dateianfang außerhalb des Frontmatters) an. Geschützte Zeilen bleiben.
+ * @param {string} md
+ * @param {boolean} withFrontmatter
+ * @param {(chunk: string) => string} fn
+ */
+function mapOutsideCodeBlocks(md, withFrontmatter, fn) {
+  const lines = md.split('\n');
+  const mask = computeProtectedMask(lines, withFrontmatter);
+  /** @type {string[]} */
+  const out = [];
+  /** @type {string[]} */
+  let buf = [];
+  const flush = () => {
+    if (buf.length) {
+      out.push(fn(buf.join('\n')));
+      buf = [];
+    }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) {
+      flush();
+      out.push(lines[i]);
+    } else {
+      buf.push(lines[i]);
+    }
+  }
+  flush();
+  return out.join('\n');
+}
+
 /** @param {string} s */
 function trimBlankLines(s) {
   const lines = s.split('\n');
@@ -250,10 +241,12 @@ function trimBlankLines(s) {
   return lines.join('\n');
 }
 
-/* ---------- Formeln mit \( … \) und \[ … \] ---------- */
+/* ---------- Formeln mit \\( … \\) und \\[ … \\] ---------- */
 
 const INLINE_MATH_HINT = /[\\^_=<>+\-*/{}|0-9]|[≤≥≠±×÷·∑∏∫√∞∂∇αβγδεθλμπσφωΔΣΩ]/;
+
 const DISPLAY_MATH_HINT = /\\[A-Za-z]{2,}|[\^_]|\\[,;:!{}]|[=<>≤≥≠]/;
+
 const PROSE_ONLY = /^[\p{L}\s,.;:!?'"„“”‚‘’()-]+$/u;
 
 /**
@@ -361,28 +354,7 @@ function convertMathChunk(text) {
  */
 function convertMathDelimiters(md, withFrontmatter = true) {
   if (md.indexOf('\\(') === -1 && md.indexOf('\\[') === -1) return md;
-  const lines = md.split('\n');
-  const mask = computeProtectedMask(lines, withFrontmatter);
-  /** @type {string[]} */
-  const out = [];
-  /** @type {string[]} */
-  let buf = [];
-  const flush = () => {
-    if (buf.length) {
-      out.push(convertMathChunk(buf.join('\n')));
-      buf = [];
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) {
-      flush();
-      out.push(lines[i]);
-    } else {
-      buf.push(lines[i]);
-    }
-  }
-  flush();
-  return out.join('\n');
+  return mapOutsideCodeBlocks(md, withFrontmatter, convertMathChunk);
 }
 
 /* ---------- <details>/<summary> ---------- */
@@ -391,9 +363,13 @@ function convertMathDelimiters(md, withFrontmatter = true) {
 // der Zeile steht. Fließtext wie „<details> ist ein HTML-Element …“ bleibt so,
 // wie er ist.
 const DETAILS_OPEN_LINE = /^[ \t]{0,3}<details(?:\s[^>]*)?>[ \t]*(?:<summary[\s>]|$)/i;
+
 const DETAILS_OPEN_NESTED = /^[ \t>]*<details(?:\s[^>]*)?>[ \t]*(?:<summary[\s>]|$)/i;
+
 const DETAILS_OPEN_ANY = /<details(?:\s[^>]*)?>/gi;
+
 const DETAILS_CLOSE_ANY = /<\/details\s*>/gi;
+
 const DETAILS_CLOSE_EDGE = /^[ \t>]*<\/details\s*>|<\/details\s*>[ \t]*$/i;
 
 /**
@@ -557,14 +533,7 @@ function findCommentRegions(lines, mask) {
  * @param {string} text Textstück ohne Code-Blöcke
  */
 function escapeCommentChunk(text) {
-  const code = findInlineCodeRanges(text);
-  let out = '';
-  let last = 0;
-  for (const [a, b] of code) {
-    out += text.slice(last, a).replace(/%%/g, '&#37;&#37;') + text.slice(a, b);
-    last = b;
-  }
-  return out + text.slice(last).replace(/%%/g, '&#37;&#37;');
+  return mapOutsideInlineCode(text, (part) => part.replace(/%%/g, '&#37;&#37;'));
 }
 
 /**
@@ -573,28 +542,7 @@ function escapeCommentChunk(text) {
  */
 function escapeComments(md, withFrontmatter = true) {
   if (md.indexOf('%%') === -1) return md;
-  const lines = md.split('\n');
-  const mask = computeProtectedMask(lines, withFrontmatter);
-  /** @type {string[]} */
-  const out = [];
-  /** @type {string[]} */
-  let buf = [];
-  const flush = () => {
-    if (buf.length) {
-      out.push(escapeCommentChunk(buf.join('\n')));
-      buf = [];
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) {
-      flush();
-      out.push(lines[i]);
-    } else {
-      buf.push(lines[i]);
-    }
-  }
-  flush();
-  return out.join('\n');
+  return mapOutsideCodeBlocks(md, withFrontmatter, escapeCommentChunk);
 }
 
 /**
@@ -617,239 +565,59 @@ function mergeRegions(...lists) {
   return out;
 }
 
-/* ---------- Einfache Zeilenumbrüche: getrennt oder zusammen ---------- */
-
-const LIST_ITEM_RE = /^[ \t]*(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$)/;
-const ATX_RE = /^[ \t]{0,3}#{1,6}(?:[ \t]|$)/;
-const HR_RE = /^[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
-const SETEXT_UNDERLINE_RE = /^[ \t]{0,3}(?:=+|-+)[ \t]*$/;
-const DEFINITION_RE = /^[ \t]{0,3}\[[^\]]+\]:/;
-const HARD_BREAK_SYNTAX_RE = /(?: {2,}|\\)$/;
-const BR_END_RE = /<br\s*\/?>$/i;
-const CALLOUT_HEAD_RE = /^\[![\w-]+\][+-]?/;
-const QUOTE_PREFIX_RE = /^((?:[ \t]{0,3}>[ \t]?)*)([\s\S]*)$/;
+/* ---------- Maskiertes HTML aus Claude-Docs-Exporten ---------- */
 
 /*
- * HTML-Blöcke nach CommonMark (Abschnitt 4.6). Typ 1 bis 5 enden an einer
- * Schlussmarke, Typ 6 und 7 an einer Leerzeile. Typ 7 (ein beliebiges Tag
- * allein auf der Zeile) kann keinen Absatz unterbrechen.
+ * Der Docs-Export maskiert Formatierungen, die er als HTML schreibt:
+ * „\<u>unterstrichen\</u>“, „H\<sub>2\</sub>O“, „\<details>&#10;\<summary>“.
+ * Hinweisboxen schreibt er als „> &#91;!NOTE\]“. Ohne Plugin stehen diese
+ * Zeichen roh da. Das Plugin stellt sie dar. Nur diese Formatierungs-Tags,
+ * nur außerhalb von Code; die Zeilenzahl bleibt gleich.
  */
-/** @type {Array<{ start: RegExp, end: RegExp }>} */
-const HTML_BLOCK_1_TO_5 = [
-  { start: /^[ \t]{0,3}<(?:script|pre|style|textarea)(?:\s|>|$)/i, end: /<\/(?:script|pre|style|textarea)>/i },
-  { start: /^[ \t]{0,3}<!--/, end: /-->/ },
-  { start: /^[ \t]{0,3}<\?/, end: /\?>/ },
-  { start: /^[ \t]{0,3}<![A-Za-z]/, end: />/ },
-  { start: /^[ \t]{0,3}<!\[CDATA\[/, end: /\]\]>/ },
-];
-const HTML_BLOCK_6_RE =
-  /^[ \t]{0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i;
-const HTML_BLOCK_7_RE =
-  /^[ \t]{0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|<\/[A-Za-z][A-Za-z0-9-]*\s*>)[ \t]*$/;
+const ESCAPED_TAG_RE =
+  /\\<(\/?)(u|ins|sub|sup|mark|kbd|b|strong|i|em|s|del|small|details|summary)(?=[\s/>])([^<>]*)>/gi;
+const TAG_GAP_RE = /(<\/?(?:details|summary)\b[^<>]*>)&#10;(?=<\/?(?:details|summary)\b)/gi;
+const ESCAPED_ALERT_RE = /^((?:[ \t]{0,3}>[ \t]?)+)&#91;!([A-Za-z][\w-]*)\\?\]/;
 
 /**
- * True, wenn die Zeile einen HTML-Block beginnt, der auch mitten in einem
- * Absatz anfangen darf (Typ 1 bis 6).
- * @param {string} content
+ * @param {string} text Textstück ohne Inline-Code
  */
-function startsInterruptingHtml(content) {
-  return HTML_BLOCK_6_RE.test(content) || HTML_BLOCK_1_TO_5.some((t) => t.start.test(content));
+function unescapeHtmlSegment(text) {
+  return text.replace(ESCAPED_TAG_RE, '<$1$2$3>').replace(TAG_GAP_RE, '$1 ');
 }
 
 /**
- * Trennt Zitat-Präfixe (>) vom Zeileninhalt.
+ * Stellt maskierte Formatierungen einer Zeile wieder her.
  * @param {string} line
  */
-function splitQuote(line) {
-  const m = QUOTE_PREFIX_RE.exec(line);
-  const prefix = m ? m[1] : '';
-  return { prefix, depth: (prefix.match(/>/g) || []).length, content: m ? m[2] : line };
+function unescapeHtmlLine(line) {
+  const out = line.replace(ESCAPED_ALERT_RE, '$1[!$2]');
+  if (out.indexOf('\\<') === -1) return out;
+  return mapOutsideInlineCode(out, unescapeHtmlSegment);
 }
 
 /**
- * Zeilen, in denen ein Zeilenumbruch nie angefasst wird: Code, Frontmatter,
- * $$-Formeln, Tabellen und HTML-Blöcke.
+ * Zeilen, wie das Plugin sie darstellt (gleich viele wie im Original).
  * @param {string[]} lines
- * @param {boolean} withFrontmatter
+ * @returns {string[]}
  */
-function computeBreakProtection(lines, withFrontmatter) {
-  const prot = computeProtectedMask(lines, withFrontmatter);
-  /** @param {number} i */
-  const content = (i) => splitQuote(lines[i]).content;
-  /** @param {number} i */
-  const blankBefore = (i) => i === 0 || content(i - 1).trim() === '';
-
-  let inMath = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (prot[i]) continue;
-    const c = content(i).trim();
-    if (inMath) {
-      prot[i] = true;
-      if (c.endsWith('$$')) inMath = false;
-      continue;
-    }
-    if (c.startsWith('$$')) {
-      prot[i] = true;
-      if (c === '$$' || !c.endsWith('$$')) inMath = true;
-    }
-  }
-  for (let i = 0; i < lines.length; i++) {
-    if (prot[i]) continue;
-    const t = content(i).replace(/\s/g, '');
-    if (t.includes('|') && t.includes('-') && /^[|:-]+$/.test(t)) {
-      if (i > 0 && lines[i - 1].trim() !== '') prot[i - 1] = true;
-      for (let j = i; j < lines.length && lines[j].trim() !== ''; j++) prot[j] = true;
-    }
-  }
-  for (let i = 0; i < lines.length; i++) {
-    if (prot[i]) continue;
-    const c = content(i);
-    const typed = HTML_BLOCK_1_TO_5.find((t) => t.start.test(c));
-    if (typed) {
-      let j = i;
-      while (j < lines.length && !prot[j]) {
-        prot[j] = true;
-        if (typed.end.test(content(j))) break;
-        j++;
-      }
-      i = j;
-      continue;
-    }
-    // Typ 7 darf nicht mitten in einem Absatz beginnen, wohl aber nach einer
-    // Leerzeile, einer Überschrift oder einem anderen geschützten Block.
-    const afterBlock = blankBefore(i) || prot[i - 1] || ATX_RE.test(content(i - 1)) || HR_RE.test(content(i - 1));
-    if (HTML_BLOCK_6_RE.test(c) || (HTML_BLOCK_7_RE.test(c) && afterBlock)) {
-      let j = i;
-      for (; j < lines.length && lines[j].trim() !== ''; j++) prot[j] = true;
-      i = j;
-    }
-  }
-  // Eingerückter Code: 4 Leerzeichen oder Tab nach einer Leerzeile, außerhalb
-  // von Listen. In Listen ist so eine Zeile ein eingerückter Absatz.
-  let inList = false;
-  let indentedRun = false;
-  for (let i = 0; i < lines.length; i++) {
-    const c = content(i);
-    if (c.trim() === '') {
-      indentedRun = false;
-      continue;
-    }
-    const isCode = !prot[i] && /^(?: {4}|\t)/.test(c) && (indentedRun || (blankBefore(i) && !inList));
-    if (isCode) {
-      prot[i] = true;
-      indentedRun = true;
-      continue;
-    }
-    indentedRun = false;
-    if (LIST_ITEM_RE.test(c)) inList = true;
-    else if (!/^[ \t]/.test(c) && (blankBefore(i) || ATX_RE.test(c) || HR_RE.test(c))) inList = false;
-  }
-  return prot;
+function prepareLines(lines) {
+  if (!lines.some((l) => l.indexOf('\\<') !== -1 || l.indexOf('&#91;!') !== -1)) return lines;
+  const mask = computeProtectedMask(lines);
+  return lines.map((l, i) => (mask[i] ? l : unescapeHtmlLine(l)));
 }
 
-/**
- * Art des Zeilenumbruchs zwischen Zeile i und i+1: 'soft' (einfacher Umbruch
- * im Absatz), 'br' (Zeile endet mit <br>, danach ein einfacher Umbruch) oder
- * null (kein einfacher Umbruch: Leerzeile, harter Umbruch, neuer Block).
- * @param {string[]} lines
- * @param {boolean[]} prot
- * @param {number} i
- * @returns {'soft' | 'br' | null}
- */
-function softBreakKind(lines, prot, i) {
-  if (prot[i] || prot[i + 1]) return null;
-  const a = splitQuote(lines[i]);
-  const b = splitQuote(lines[i + 1]);
-  if (a.content.trim() === '' || b.content.trim() === '') return null;
-  if (HARD_BREAK_SYNTAX_RE.test(a.content)) return null;
-  if (b.depth > a.depth) return null;
-  if (CALLOUT_HEAD_RE.test(a.content.trim())) return null;
-  for (const c of [a.content, b.content]) {
-    if (ATX_RE.test(c) || HR_RE.test(c) || DEFINITION_RE.test(c) || FENCE_RE.test(c) || startsInterruptingHtml(c)) return null;
-    if (/^[ \t]*\|/.test(c)) return null;
-  }
-  if (LIST_ITEM_RE.test(b.content) && listItemBreaksParagraph(lines, i, b.content)) return null;
-  if (SETEXT_UNDERLINE_RE.test(b.content) || SETEXT_UNDERLINE_RE.test(a.content)) return null;
-  return BR_END_RE.test(a.content.replace(/[ \t]+$/, '')) ? 'br' : 'soft';
-}
-
-const ORDERED_ITEM_RE = /^[ \t]*(\d{1,9})[.)](?:[ \t]+|$)/;
+/* ---------- Abschnitt neu bauen ---------- */
 
 /**
- * Beendet Zeile i+1 (ein Listenpunkt) den Absatz in Zeile i? Nach CommonMark
- * unterbricht eine nummerierte Liste einen Absatz nur, wenn sie mit 1
- * beginnt; „Seit⏎2024. Jahr“ ist ein Absatz. Gehört der Absatz selbst zu
- * einer Liste, ist „2.“ dagegen der nächste Punkt.
- * @param {string[]} lines
- * @param {number} i
- * @param {string} nextContent Inhalt von Zeile i+1 ohne Zitat-Präfix
- */
-function listItemBreaksParagraph(lines, i, nextContent) {
-  const m = ORDERED_ITEM_RE.exec(nextContent);
-  if (!m || Number(m[1]) === 1) return true;
-  for (let j = i; j >= 0; j--) {
-    const c = splitQuote(lines[j]).content;
-    if (c.trim() === '' || ATX_RE.test(c) || HR_RE.test(c) || FENCE_RE.test(c)) return false;
-    const first = j === 0 || splitQuote(lines[j - 1]).content.trim() === '';
-    // „2024. Jahr“ mitten im Absatz ist Fortsetzungstext (oder ein späterer
-    // Listenpunkt): weiter zurückgehen, bis der Absatz- oder Listenanfang klar ist.
-    const om = ORDERED_ITEM_RE.exec(c);
-    if (om && Number(om[1]) !== 1 && !first) continue;
-    if (LIST_ITEM_RE.test(c) || /^[ \t]/.test(c)) return true;
-    if (first) return false;
-  }
-  return false;
-}
-
-/**
- * Macht einfache Zeilenumbrüche eindeutig: 'split' setzt einen harten
- * Umbruch (jede Zeile einzeln), 'join' zieht die Zeilen zu einem Absatz
- * zusammen (CommonMark-Norm). Harte Umbrüche, Listen, Tabellen, Code und
- * Überschriften bleiben unverändert. Endet eine Zeile mit <br>, ist das schon
- * der Umbruch: 'split' lässt sie, 'join' hängt die nächste Zeile an.
+ * Wandelt alles um (für die Vorschau von ```markdown-Blöcken).
  * @param {string} md
- * @param {BreakMode} mode
- * @param {boolean} [withFrontmatter]
  */
-function convertSoftBreaks(md, mode, withFrontmatter = true) {
-  if (md.indexOf('\n') === -1) return md;
-  const lines = md.split('\n');
-  const prot = computeBreakProtection(lines, withFrontmatter);
-  /** @type {string[]} */
-  const out = [];
-  let i = 0;
-  while (i < lines.length) {
-    let cur = lines[i];
-    while (i + 1 < lines.length) {
-      const kind = softBreakKind(lines, prot, i);
-      if (!kind || (kind === 'br' && mode === 'split')) break;
-      if (mode === 'split') {
-        out.push(cur.replace(/[ \t]+$/, '') + '  ');
-        i++;
-        cur = lines[i];
-      } else {
-        const next = splitQuote(lines[i + 1]).content.replace(/^[ \t]+/, '');
-        cur = cur.replace(/[ \t]+$/, '') + ' ' + next;
-        i++;
-      }
-    }
-    out.push(cur);
-    i++;
-  }
-  return out.join('\n');
-}
-
-/**
- * Wandelt alles um (für Vorschauen und verschachtelte Darstellungen).
- * @param {string} md
- * @param {{ details: boolean, delims: boolean, comments?: boolean, breaks?: BreakMode | null }} opts
- */
-function transformMarkdown(md, opts) {
-  let out = md;
-  if (opts.details) out = convertDetailsInText(out);
-  if (opts.delims) out = convertMathDelimiters(out);
-  if (opts.comments) out = escapeComments(out);
-  if (opts.breaks) out = convertSoftBreaks(out, opts.breaks, true);
+function transformMarkdown(md) {
+  let out = prepareLines(md.split('\n')).join('\n');
+  out = convertDetailsInText(out);
+  out = convertMathDelimiters(out);
+  out = escapeComments(out);
   return out;
 }
 
@@ -858,39 +626,42 @@ function transformMarkdown(md, opts) {
  * Obsidian rendert jeden durch Leerzeilen getrennten Block einzeln; ein
  * <details>-Block mit Leerzeilen zerfällt dabei in mehrere Abschnitte. Der
  * erste Abschnitt zeigt deshalb den ganzen Block, die übrigen bleiben leer.
- * Dasselbe gilt für Bereiche, die Obsidian als Kommentar %%…%% ausblendet.
- * @param {string[]} lines Zeilen der ganzen Datei
+ * Dasselbe gilt für Bereiche zwischen zwei %%, die Obsidian als Kommentar
+ * ausblendet.
+ * @param {string[]} lines vorbereitete Zeilen der ganzen Datei (prepareLines)
+ * @param {string[]} raw Originalzeilen der ganzen Datei
  * @param {number} lineStart
  * @param {number} lineEnd
- * @param {Array<{ start: number, end: number }>} regions <details>- und Kommentarbereiche
- * @param {{ details: boolean, delims: boolean, comments?: boolean, breaks?: BreakMode | null }} opts
+ * @param {Region[]} regions <details>- und Kommentarbereiche
+ * @param {boolean} [hasComments] Datei enthält %%-Paare; nur dann wird %% maskiert
+ *   (ein einzelnes %% zeigt Obsidian ohnehin als Text)
  * @returns {{ changed: boolean, markdown: string }}
  */
-function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
+function buildSectionMarkdown(lines, raw, lineStart, lineEnd, regions, hasComments = false) {
   /** @type {string[]} */
   const parts = [];
-  let changed = false;
+  let inRegion = false;
   let i = lineStart;
   const last = Math.min(lineEnd, lines.length - 1);
   while (i <= last) {
     const line = i;
     const r = regions.length ? regions.find((x) => x.start <= line && line <= x.end) : undefined;
     if (r && r.start < lineStart) {
-      changed = true;
+      inRegion = true;
       i = r.end + 1;
       continue;
     }
     if (r && r.start === i) {
-      changed = true;
+      inRegion = true;
       const block = lines.slice(r.start, r.end + 1).join('\n');
-      if (opts.details && DETAILS_OPEN_LINE.test(lines[r.start])) {
+      if (DETAILS_OPEN_LINE.test(lines[r.start])) {
         // <details> ist ein eigener Block: Leerzeilen davor und danach.
         if (parts.length && parts[parts.length - 1].trim() !== '') parts.push('');
         parts.push(convertDetailsInText(block, false));
         parts.push('');
       } else {
         // Kommentarbereich: kann mitten im Absatz beginnen, keine Leerzeilen einfügen.
-        parts.push(opts.details ? convertDetailsInText(block, false) : block);
+        parts.push(convertDetailsInText(block, false));
       }
       i = r.end + 1;
       continue;
@@ -899,31 +670,13 @@ function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
     i++;
   }
   let markdown = parts.join('\n');
-  if (opts.delims) {
-    const converted = convertMathDelimiters(markdown, lineStart === 0);
-    if (converted !== markdown) {
-      changed = true;
-      markdown = converted;
-    }
-  }
-  if (opts.comments) {
-    const converted = escapeComments(markdown, lineStart === 0);
-    if (converted !== markdown) {
-      changed = true;
-      markdown = converted;
-    }
-  }
-  if (opts.breaks) {
-    const converted = convertSoftBreaks(markdown, opts.breaks, lineStart === 0);
-    if (converted !== markdown) {
-      changed = true;
-      markdown = converted;
-    }
-  }
-  return { changed, markdown };
+  markdown = convertMathDelimiters(markdown, lineStart === 0);
+  if (hasComments) markdown = escapeComments(markdown, lineStart === 0);
+  const original = raw.slice(lineStart, last + 1).join('\n');
+  return { changed: inRegion || markdown !== original, markdown };
 }
 
-/* ---------- Fußnoten (für neu dargestellte Abschnitte) ---------- */
+/* ---------- Fußnoten, Überschriften und GitHub-Anker ---------- */
 
 /**
  * @param {string[]} lines
@@ -933,8 +686,8 @@ function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
 function collectFootnotes(lines, mask) {
   /** @type {Map<string, string>} */
   const defs = new Map();
-  /** @type {Map<string, number>} */
-  const order = new Map();
+  /** @type {string[]} Verweise in der Reihenfolge ihres ersten Auftretens */
+  const refs = [];
   const defRe = /^\[\^([^\]\s]+)\]:\s?(.*)$/;
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
@@ -957,14 +710,17 @@ function collectFootnotes(lines, mask) {
     const refRe = /\[\^([^\]\s]+)\](?!:)/g;
     const line = stripInlineCode(lines[i]);
     let m;
-    while ((m = refRe.exec(line)) !== null) {
-      if (!order.has(m[1])) order.set(m[1], order.size + 1);
-    }
+    while ((m = refRe.exec(line)) !== null) refs.push(m[1]);
+  }
+  // Nummeriert werden nur Verweise mit Definition: Ein [^x] ohne Definition
+  // bleibt Text und bekommt keine Nummer (wie bei GitHub und markdown-it).
+  /** @type {Map<string, number>} */
+  const order = new Map();
+  for (const id of refs) {
+    if (defs.has(id) && !order.has(id)) order.set(id, order.size + 1);
   }
   return { defs, order };
 }
-
-/* ---------- Überschriften und GitHub-Anker ---------- */
 
 /**
  * Slug wie bei GitHub (github-slugger): Kleinbuchstaben, Satzzeichen und
@@ -1001,11 +757,6 @@ function headingPlainText(raw) {
   s = s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ');
   return s.trim();
 }
-
-/**
- * @typedef {{ text: string, raw: string, line: number, level: number, slug: string }} HeadingEntry
- * @typedef {{ headings: HeadingEntry[], anchors: Array<{ id: string, line: number }> }} HeadingIndex
- */
 
 /**
  * @param {Array<{ raw: string, line: number, level: number }>} list
@@ -1119,58 +870,9 @@ function linkSafeHeading(raw) {
   return raw.replace(/[#|^:%[\]\\]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/* ---------- Claude-Docs-Export erkennen ---------- */
+/* ---------- Formeln, CSV, Platzhalter, Tabellen ---------- */
 
-const MONTHS = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
-const DOCS_DATE = `(?:${MONTHS}) \\d{1,2}, \\d{4}`;
-const DOCS_BYLINE_RE = new RegExp(`^(?:${DOCS_DATE}(?: · @.+)?|@.+ · ${DOCS_DATE})$`);
 const EMBED_PLACEHOLDER_RE = /^\[embedded content(?::\s*([\s\S]*?))?\]$/;
-
-/**
- * @param {string} folders Kommagetrennte Liste aus den Einstellungen
- * @returns {string[]}
- */
-function parseFolderList(folders) {
-  return folders
-    .split(/[,\n]/)
-    .map((f) => f.trim().replace(/^\/+|\/+$/g, ''))
-    .filter(Boolean);
-}
-
-/**
- * Liegt der Pfad in einem der Ordner? Groß- und Kleinschreibung zählen nicht
- * (macOS und iPadOS unterscheiden sie im Dateisystem auch nicht).
- * @param {string} path
- * @param {string[]} folders
- */
-function inDocsFolder(path, folders) {
-  if (!path) return false;
-  const p = path.toLowerCase();
-  return folders.some((f) => {
-    const fl = f.toLowerCase();
-    return p === fl || p.startsWith(fl + '/');
-  });
-}
-
-/**
- * Erkennt einen Markdown-Export aus Claude Docs.
- * @param {string} text
- * @param {string} path
- * @param {string[]} folders
- */
-function isDocsExport(text, path, folders) {
-  if (inDocsFolder(path, folders)) return true;
-  if (text.includes('&#91;embedded content')) return true;
-  const head = splitLines(text).slice(0, 15).map((l) => l.trim());
-  const h1 = head.findIndex((l) => /^# \S/.test(l));
-  if (h1 >= 0) {
-    const next = head.slice(h1 + 1).find((l) => l !== '');
-    if (next && DOCS_BYLINE_RE.test(next)) return true;
-  }
-  return false;
-}
-
-/* ---------- Formeln aus ```latex / ```math ---------- */
 
 const LATEX_DOCUMENT_RE =
   /\\documentclass|\\usepackage|\\begin\{document\}|\\(?:sub)*section\*?\{|\\chapter\*?\{|\\maketitle|\\title\{|\\author\{|\\(?:input|include)\{|\\bibliography|\\begin\{(?:itemize|enumerate|description|figure|table|tabular|abstract|center|verbatim|lstlisting|minted|tikzpicture|thebibliography|frame)\}/;
@@ -1240,8 +942,6 @@ function mathHasError(el) {
   if (el.matches('mjx-merror, [data-mjx-error], .katex-error')) return true;
   return el.querySelector('mjx-merror, [data-mjx-error], .katex-error') !== null;
 }
-
-/* ---------- CSV ---------- */
 
 /**
  * Trennzeichen raten (Komma, Semikolon, Tab).
@@ -1343,10 +1043,6 @@ function numericColumns(rows, cols) {
   return result;
 }
 
-/* ======================================================================
- * DOM-Hilfsfunktionen
- * ==================================================================== */
-
 /**
  * Ersetzt Platzhalter wie "[embedded content: Titel]" aus Docs-Exporten durch
  * einen deutlichen Hinweis.
@@ -1397,79 +1093,6 @@ function wrapTables(root) {
     wrap.className = 'cmv-table-scroll';
     parent.insertBefore(wrap, table);
     wrap.appendChild(table);
-  }
-}
-
-const WWW_RE = /(^|[\s(\[<"'„“])(www\.[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+(?:[/?#][^\s<>"')\]]*)?)/gi;
-
-/**
- * Verlinkt nackte www.-Adressen (GitHub tut das, Obsidian nicht).
- * @param {HTMLElement} root
- */
-function linkifyWww(root) {
-  if (!/www\./i.test(root.textContent || '')) return;
-  const doc = root.ownerDocument;
-  const walker = doc.createTreeWalker(root, 4 /* NodeFilter.SHOW_TEXT */);
-  /** @type {Text[]} */
-  const nodes = [];
-  let n;
-  while ((n = walker.nextNode()) !== null) {
-    const parent = n.parentElement;
-    if (!parent || parent.closest('a, code, pre, .math, mjx-container, .katex, svg')) continue;
-    if (/www\./i.test(n.nodeValue || '')) nodes.push(/** @type {Text} */ (n));
-  }
-  for (const node of nodes) {
-    const text = node.nodeValue || '';
-    WWW_RE.lastIndex = 0;
-    const frag = doc.createDocumentFragment();
-    let last = 0;
-    let any = false;
-    let m;
-    while ((m = WWW_RE.exec(text)) !== null) {
-      let url = m[2];
-      const trail = /[.,;:!?]+$/.exec(url);
-      if (trail) url = url.slice(0, -trail[0].length);
-      const start = m.index + m[1].length;
-      frag.append(text.slice(last, start));
-      const a = doc.createElement('a');
-      a.className = 'external-link';
-      a.href = 'https://' + url;
-      a.textContent = url;
-      a.setAttribute('target', '_blank');
-      a.setAttribute('rel', 'noopener nofollow');
-      frag.append(a);
-      last = start + url.length;
-      any = true;
-    }
-    if (!any) continue;
-    frag.append(text.slice(last));
-    node.replaceWith(frag);
-  }
-}
-
-/**
- * Obsidian macht aus „#wort“ einen Tag. Claude kennt keine Tags und zeigt den
- * Text, wie er dasteht (etwa #include oder eine Farbe wie #ff0000).
- * @param {HTMLElement} root
- */
-function plainTags(root) {
-  const tags = root.matches('a.tag') ? [root] : Array.from(root.querySelectorAll('a.tag'));
-  for (const a of tags) {
-    if (a.closest('code, pre')) continue;
-    a.replaceWith(a.ownerDocument.createTextNode(a.textContent || ''));
-  }
-}
-
-/**
- * Obsidian macht aus „==wort==“ eine Markierung. Im Claude-Chat und nach der
- * Norm steht dort „==wort==“; aus „a==b und c==d“ würde sonst „b und c“
- * markiert und die Gleichheitszeichen fehlten.
- * @param {HTMLElement} root
- */
-function unwrapMarks(root) {
-  for (const mark of Array.from(root.querySelectorAll('mark'))) {
-    if (mark.closest('code, pre')) continue;
-    mark.replaceWith('==', ...Array.from(mark.childNodes), '==');
   }
 }
 
@@ -1555,194 +1178,69 @@ function renderCsvTable(container, rows) {
   }
 }
 
+/* ---------- Bilder mit relativem Pfad ---------- */
+
 /**
- * Kleine Werkzeugleiste oben rechts an einem Block.
- * @param {HTMLElement} host
- * @param {Array<{ icon: string, label: string, onClick: (btn: HTMLElement) => void }>} buttons
+ * Pfad eines Bilds relativ zur Datei auflösen (für <img src="bilder/a.png">,
+ * das Obsidian sonst nicht findet). null bei Adressen mit Schema oder Anker.
+ * @param {string} src
+ * @param {string} sourcePath Pfad der Markdown-Datei im Vault
+ * @returns {string | null} Vault-Pfad oder null
  */
-function addToolbar(host, buttons) {
-  const bar = host.createDiv({ cls: 'cmv-toolbar' });
-  for (const b of buttons) {
-    const btn = bar.createEl('button', { cls: 'cmv-toolbar-btn', attr: { type: 'button' } });
-    setButtonFace(btn, b.icon, b.label);
-    btn.addEventListener('click', (evt) => {
-      evt.preventDefault();
-      evt.stopPropagation();
-      b.onClick(btn);
-    });
+function relativeImagePath(src, sourcePath) {
+  if (!src || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(src)) return null;
+  const clean = safeDecode(src.split(/[?#]/)[0]);
+  if (!clean) return null;
+  if (clean.startsWith('/')) return clean.replace(/^\/+/, '');
+  const base = sourcePath.includes('/') ? sourcePath.slice(0, sourcePath.lastIndexOf('/')).split('/') : [];
+  for (const part of clean.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') base.pop();
+    else base.push(part);
   }
-  return bar;
+  return base.join('/');
 }
 
 /**
- * Setzt Symbol und Beschriftung eines Knopfs (Text, falls das Symbol fehlt).
- * @param {HTMLElement} btn
- * @param {string} icon
- * @param {string} label
+ * ```svg als Bild. Als data:-Adresse in <img> laufen keine Skripte aus der
+ * Datei.
+ * @param {string} source
+ * @returns {string | null}
  */
-function setButtonFace(btn, icon, label) {
-  btn.empty();
-  btn.setAttr('aria-label', label);
-  btn.setAttr('title', label);
-  setIcon(btn, icon);
-  if (!btn.querySelector('svg')) btn.setText(label);
-}
-
-/* ======================================================================
- * Darstellung je Datei: wie Claude (Docs oder Chat/Code) oder Norm
- * ==================================================================== */
-
-/** @type {Record<FileStyle, string>} */
-const STYLE_SHORT = { docs: 'wie Claude Docs', chat: 'wie Claude-Chat/Code', norm: 'Norm' };
-
-/** @type {Record<FileStyle, string>} */
-const STYLE_LONG = {
-  docs: 'Wie Claude Docs (Docs-Export)',
-  chat: 'Wie Claude-Chat und Claude Code',
-  norm: 'Norm (Markdown-Standard wie auf GitHub)',
-};
-
-/** @type {Record<BreakMode, string>} */
-const BREAKS_SHORT = { split: 'getrennt', join: 'zusammen' };
-
-/** @type {Record<BreakMode, string>} */
-const BREAKS_LONG = {
-  split: 'Getrennt: jede Zeile einzeln',
-  join: 'Zusammen: ein Absatz (Norm)',
-};
-
-/** @type {BreakMode[]} */
-const BREAK_MODES = ['split', 'join'];
-
-/**
- * Übernimmt aus gespeicherten Datei-Einstellungen nur gültige Einträge.
- * @param {unknown} raw
- * @returns {Record<string, FileMode>}
- */
-function sanitizeFileModes(raw) {
-  /** @type {Record<string, FileMode>} */
-  const out = {};
-  if (!raw || typeof raw !== 'object') return out;
-  for (const [path, value] of Object.entries(raw)) {
-    if (!value || typeof value !== 'object') continue;
-    const v = /** @type {any} */ (value);
-    /** @type {FileMode} */
-    const fm = {};
-    if (FILE_STYLES.includes(v.style)) fm.style = v.style;
-    if (BREAK_MODES.includes(v.breaks)) fm.breaks = v.breaks;
-    if (fm.style || fm.breaks) out[path] = fm;
-  }
-  return out;
-}
-
-/**
- * Darstellung ohne eigene Einstellung der Datei.
- * @param {ViewerSettings} settings
- * @param {boolean} isDocs
- * @returns {FileStyle}
- */
-function autoStyle(settings, isDocs) {
-  if (settings.renderMode === 'norm') return 'norm';
-  return isDocs ? 'docs' : 'chat';
-}
-
-/**
- * @param {ViewerSettings} settings
- * @param {string} path
- * @param {boolean} isDocs
- * @returns {FileStyle}
- */
-function resolveStyle(settings, path, isDocs) {
-  const own = settings.fileModes[path];
-  if (own && own.style) return own.style;
-  return autoStyle(settings, isDocs);
-}
-
-/**
- * Zeilenumbrüche ohne eigene Einstellung der Datei.
- * @param {ViewerSettings} settings
- * @param {FileStyle} style
- * @returns {BreakMode}
- */
-function autoLineBreaks(settings, style) {
-  return settings.lineBreaks === 'auto' ? AUTO_BREAKS[style] : settings.lineBreaks;
-}
-
-/**
- * @param {ViewerSettings} settings
- * @param {string} path
- * @param {FileStyle} style
- * @returns {BreakMode}
- */
-function resolveLineBreaks(settings, path, style) {
-  const own = settings.fileModes[path];
-  if (own && own.breaks) return own.breaks;
-  return autoLineBreaks(settings, style);
-}
-
-/**
- * Was am Text noch zu tun ist, damit Obsidian die Zeilenumbrüche wie gewünscht
- * zeigt. null: Obsidian zeigt sie schon so.
- * @param {BreakMode} mode
- * @param {boolean | null} strict Obsidian-Einstellung „Strenge Zeilenumbrüche“, null wenn unbekannt
- * @returns {BreakMode | null}
- */
-function breakTransform(mode, strict) {
-  if (mode === 'join' && strict === true) return null;
-  if (mode === 'split' && strict === false) return null;
-  return mode;
-}
-
-/**
- * Verschiebt Datei-Einstellungen nach Umbenennen einer Datei oder eines Ordners.
- * @param {Record<string, FileMode>} fileModes
- * @param {string} oldPath
- * @param {string} newPath
- * @returns {boolean} true, wenn sich etwas geändert hat
- */
-function moveFileModes(fileModes, oldPath, newPath) {
-  let changed = false;
-  for (const key of Object.keys(fileModes)) {
-    /** @type {string | null} */
-    let next = null;
-    if (key === oldPath) next = newPath;
-    else if (key.startsWith(oldPath + '/')) next = newPath + key.slice(oldPath.length);
-    if (next === null || next === key) continue;
-    fileModes[next] = fileModes[key];
-    delete fileModes[key];
-    changed = true;
-  }
-  return changed;
+function svgDataUrl(source) {
+  const s = source.trim();
+  // Vor dem <svg>-Tag erlaubt: XML-Deklaration, Kommentare, DOCTYPE (ohne
+  // eigene Entity-Definitionen in [ … ]).
+  const m = /^(?:<\?xml[\s\S]*?\?>\s*)?(?:<!--[\s\S]*?-->\s*|<!DOCTYPE\s+svg\b[^>[]*>\s*)*<svg(?=[\s>])/i.exec(s);
+  if (!m) return null;
+  // Ohne xmlns am <svg>-Tag selbst zeigt der Browser das Bild nicht an.
+  // Geprüft wird nur dieses Tag, nicht ein xmlns weiter innen oder in einem
+  // Kommentar davor.
+  const at = m[0].length;
+  const rootTag = s.slice(at, s.indexOf('>', at) + 1);
+  const withNs = /\sxmlns\s*=/.test(rootTag) ? s : s.slice(0, at) + ' xmlns="http://www.w3.org/2000/svg"' + s.slice(at);
+  return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(withNs);
 }
 
 /* ======================================================================
  * Plugin
  * ==================================================================== */
 
-/**
- * @typedef {Object} SwitchView
- * @property {string} id
- * @property {string} icon Symbol des Knopfs, der zu dieser Ansicht wechselt
- * @property {string} label Beschriftung dieses Knopfs
- * @property {(pane: HTMLElement) => Promise<boolean>} render false: Ansicht nicht möglich
- */
-
 class ClaudeMarkdownViewer extends Plugin {
   /** @type {ViewerSettings} */
-  settings = Object.assign({}, DEFAULT_SETTINGS, { fileModes: {} });
+  settings = Object.assign({}, DEFAULT_SETTINGS);
 
   /** Analyse der ganzen Datei je Darstellung (docId). */
-  /** @type {Map<string, { text: string, lines: string[], regions: Array<{ start: number, end: number }>, hasDetails: boolean, hasComments: boolean, isDocs: boolean, footnotes: { defs: Map<string, string>, order: Map<string, number> } }>} */
+  /** @type {Map<string, { text: string, raw: string[], lines: string[], regions: Region[], hasComments: boolean, footnotes: { defs: Map<string, string>, order: Map<string, number> } }>} */
   analysisByDoc = new Map();
 
   /**
-   * Claude-Docs-Erkennung je Dateipfad. len: Länge des Texts, aus dem sie
-   * stammt. Verschachtelte Darstellungen (Klappbereich, Markdown-Vorschau)
-   * sehen nur einen Ausschnitt; der längste Text, also die ganze Datei, gilt.
-   * mark: ob die Datei ein wörtliches <mark>-Tag enthält.
+   * Ergebnis des Schnelltests je Darstellung (docId): Enthält die Datei
+   * überhaupt etwas, das umgebaut werden müsste? Ohne Merker liefe der Test
+   * für jeden Abschnitt über die ganze Datei.
+   * @type {Map<string, { text: string, hit: boolean }>}
    */
-  /** @type {Map<string, { flag: boolean, len: number, mark: boolean }>} */
-  docsFlagByPath = new Map();
+  quickCheckByDoc = new Map();
 
   /** Pfade, deren Darstellung Mehrabschnitts-Blöcke (<details>, %%) enthält. */
   /** @type {Set<string>} */
@@ -1757,10 +1255,6 @@ class ClaudeMarkdownViewer extends Plugin {
   /** Fenster, in denen Klick-Handler und Klassen schon gesetzt sind. */
   /** @type {WeakSet<Document>} */
   attachedDocuments = new WeakSet();
-
-  /** Augen-Symbol „Darstellung dieser Datei“ je Ansicht. */
-  /** @type {WeakMap<import('obsidian').MarkdownView, HTMLElement>} */
-  viewActions = new WeakMap();
 
   async onload() {
     await this.loadSettings();
@@ -1783,9 +1277,10 @@ class ClaudeMarkdownViewer extends Plugin {
         busy.push(lang);
       }
     };
-    for (const lang of ['latex', 'math']) codeBlock(lang, (source, el, ctx) => this.renderTexBlock(source, el, ctx, lang));
-    for (const lang of ['csv', 'tsv']) codeBlock(lang, (source, el, ctx) => this.renderCsvBlock(source, el, ctx, lang));
+    for (const lang of ['latex', 'math']) codeBlock(lang, (source, el) => this.renderTexBlock(source, el));
+    for (const lang of ['csv', 'tsv']) codeBlock(lang, (source, el) => this.renderCsvBlock(source, el, lang));
     for (const lang of ['markdown', 'md']) codeBlock(lang, (source, el, ctx) => this.renderMarkdownBlock(source, el, ctx));
+    codeBlock('svg', (source, el) => this.renderSvgBlock(source, el));
     if (busy.length) {
       new Notice(`Claude Markdown Viewer: Code-Blöcke „${busy.join('“, „')}“ sind von einem anderen Plugin belegt und werden nicht umgebaut.`);
     }
@@ -1794,55 +1289,24 @@ class ClaudeMarkdownViewer extends Plugin {
     this.registerMarkdownPostProcessor((el, ctx) => this.processDom(el, ctx), 200);
 
     this.attachToDocument(document);
-    this.registerEvent(
-      this.app.workspace.on('window-open', (win) => {
-        this.attachToDocument(win.doc);
-      })
-    );
+    this.registerEvent(this.app.workspace.on('window-open', (win) => this.attachToDocument(win.doc)));
 
-    const onLayout = () => {
-      this.enforceReadingView();
-      this.refreshViewActions();
-    };
-    this.registerEvent(this.app.workspace.on('layout-change', onLayout));
-    this.registerEvent(this.app.workspace.on('active-leaf-change', onLayout));
-    this.registerEvent(this.app.workspace.on('file-open', onLayout));
+    const lock = () => this.enforceReadingView();
+    this.registerEvent(this.app.workspace.on('layout-change', lock));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', lock));
+    this.registerEvent(this.app.workspace.on('file-open', lock));
     this.registerEvent(this.app.vault.on('modify', (file) => this.onFileModified(file)));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.onFileRenamed(file, oldPath)));
 
-    this.addCommand({
-      id: 'file-display-menu',
-      name: 'Darstellung dieser Datei wählen …',
-      checkCallback: (checking) => this.withActiveView(checking, (view) => this.openModeMenu(view, null)),
-    });
-    this.addCommand({
-      id: 'toggle-norm',
-      name: 'Diese Datei: Norm oder wie Claude',
-      checkCallback: (checking) => this.withActiveView(checking, (view) => void this.toggleNorm(view)),
-    });
-    this.addCommand({
-      id: 'toggle-line-breaks',
-      name: 'Diese Datei: Zeilenumbrüche getrennt oder zusammen',
-      checkCallback: (checking) => this.withActiveView(checking, (view) => void this.toggleLineBreaks(view)),
-    });
-    this.addCommand({
-      id: 'rerender',
-      name: 'Alle offenen Dateien neu darstellen',
-      callback: () => this.rerenderAll(),
-    });
-
     this.app.workspace.onLayoutReady(() => {
       for (const doc of this.knownDocuments()) this.attachToDocument(doc);
-      onLayout();
+      lock();
       this.rerenderAll();
     });
   }
 
   onunload() {
-    for (const doc of this.knownDocuments()) {
-      doc.body.classList.remove('cmv-readonly-tasks', 'cmv-gh-alerts', 'cmv-readonly-properties');
-      doc.querySelectorAll('.cmv-view-action').forEach((node) => node.remove());
-    }
+    for (const doc of this.knownDocuments()) doc.body.classList.remove('cmv-view-only');
     for (const t of this.rerenderTimers.values()) window.clearTimeout(t);
     this.rerenderAll();
   }
@@ -1850,22 +1314,15 @@ class ClaudeMarkdownViewer extends Plugin {
   async loadSettings() {
     /** @type {any} */
     const data = (await this.loadData()) || {};
-    /** @type {any} */
-    const s = Object.assign({}, DEFAULT_SETTINGS, data);
-    if (s.renderMode !== 'norm') s.renderMode = 'claude';
-    if (s.lineBreaks !== 'split' && s.lineBreaks !== 'join') s.lineBreaks = 'auto';
-    s.fileModes = sanitizeFileModes(data.fileModes);
-    // Einstellungen aus Version 1.0.0, die es nicht mehr gibt.
-    for (const key of ['markdownBlockMode', 'renderLatexBlocks', 'renderCsvBlocks', 'renderMathDelimiters']) delete s[key];
-    this.settings = s;
+    // Bis 1.2.1 hieß die Einstellung lockReadingView; andere Einstellungen gibt es nicht mehr.
+    const viewOnly =
+      typeof data.viewOnly === 'boolean' ? data.viewOnly : typeof data.lockReadingView === 'boolean' ? data.lockReadingView : true;
+    this.settings = { viewOnly };
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
     this.applyBodyClasses();
-    this.analysisByDoc.clear();
-    this.docsFlagByPath.clear();
-    this.rerenderAll();
     this.enforceReadingView();
   }
 
@@ -1901,11 +1358,8 @@ class ClaudeMarkdownViewer extends Plugin {
 
   /** @param {Document} [only] */
   applyBodyClasses(only) {
-    const docs = only ? [only] : this.knownDocuments();
-    for (const doc of docs) {
-      doc.body.classList.toggle('cmv-readonly-tasks', this.settings.readOnlyCheckboxes);
-      doc.body.classList.toggle('cmv-gh-alerts', this.settings.githubAlertColors);
-      doc.body.classList.toggle('cmv-readonly-properties', this.settings.lockReadingView);
+    for (const doc of only ? [only] : this.knownDocuments()) {
+      doc.body.classList.toggle('cmv-view-only', this.settings.viewOnly);
     }
   }
 
@@ -1920,17 +1374,14 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {MouseEvent} evt
    */
   onGuardClick(evt) {
+    if (!this.settings.viewOnly) return;
     const target = /** @type {Element | null} */ (evt.target);
     if (!target || typeof target.closest !== 'function') return;
-    if (
-      this.settings.readOnlyCheckboxes &&
-      target.matches('input.task-list-item-checkbox') &&
-      target.closest('.markdown-preview-view, .markdown-rendered')
-    ) {
+    if (target.matches('input.task-list-item-checkbox') && target.closest('.markdown-preview-view, .markdown-rendered')) {
       this.stopEvent(evt);
       return;
     }
-    if (this.settings.lockReadingView && target.closest(PROPERTIES_SELECTOR) && !target.closest('a, .metadata-properties-heading')) {
+    if (target.closest(PROPERTIES_SELECTOR) && !target.closest('a, .metadata-properties-heading')) {
       this.stopEvent(evt);
     }
   }
@@ -1941,7 +1392,7 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {FocusEvent} evt
    */
   onGuardFocus(evt) {
-    if (!this.settings.lockReadingView) return;
+    if (!this.settings.viewOnly) return;
     const target = /** @type {HTMLElement | null} */ (evt.target);
     if (!target || typeof target.closest !== 'function' || !target.closest(PROPERTIES_SELECTOR)) return;
     if (target.closest('a, .metadata-properties-heading')) return;
@@ -1953,7 +1404,7 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {Event} evt
    */
   onGuardInput(evt) {
-    if (!this.settings.lockReadingView) return;
+    if (!this.settings.viewOnly) return;
     const target = /** @type {Element | null} */ (evt.target);
     if (!target || typeof target.closest !== 'function' || !target.closest(PROPERTIES_SELECTOR)) return;
     evt.preventDefault();
@@ -1967,7 +1418,7 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {MouseEvent} evt
    */
   onContextMenu(evt) {
-    if (!this.settings.blockUnresolvedLinks) return;
+    if (!this.settings.viewOnly) return;
     const target = /** @type {Element | null} */ (evt.target);
     if (!target || typeof target.closest !== 'function') return;
     const a = target.closest('a.is-unresolved');
@@ -1980,7 +1431,7 @@ class ClaudeMarkdownViewer extends Plugin {
   /* ---------- Leseansicht ---------- */
 
   enforceReadingView() {
-    if (!this.settings.lockReadingView) return;
+    if (!this.settings.viewOnly) return;
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
       if (!(view instanceof MarkdownView)) return;
@@ -1998,26 +1449,15 @@ class ClaudeMarkdownViewer extends Plugin {
 
   rerenderAll() {
     this.analysisByDoc.clear();
+    this.quickCheckByDoc.clear();
     for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
       const view = leaf.view;
       if (view instanceof MarkdownView && view.previewMode) view.previewMode.rerender(true);
     }
   }
 
-  /** @param {string} path */
-  rerenderPath(path) {
-    for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
-      const view = leaf.view;
-      if (view instanceof MarkdownView && view.file && view.file.path === path && view.previewMode) {
-        view.previewMode.rerender(true);
-      }
-    }
-  }
-
   /** @param {import('obsidian').TAbstractFile} file */
   onFileModified(file) {
-    // Die Datei kann jetzt kürzer sein: Docs-Erkennung neu bestimmen.
-    this.docsFlagByPath.delete(file.path);
     if (!(file instanceof TFile) || !this.pathsWithRegions.has(file.path)) return;
     const old = this.rerenderTimers.get(file.path);
     if (old) window.clearTimeout(old);
@@ -2034,219 +1474,24 @@ class ClaudeMarkdownViewer extends Plugin {
   }
 
   /**
-   * Eigene Einstellungen wandern beim Umbenennen mit (Datei oder Ordner).
    * @param {import('obsidian').TAbstractFile} file
    * @param {string} oldPath
    */
   onFileRenamed(file, oldPath) {
     if (this.pathsWithRegions.delete(oldPath)) this.pathsWithRegions.add(file.path);
-    this.docsFlagByPath.delete(oldPath);
-    if (moveFileModes(this.settings.fileModes, oldPath, file.path)) {
-      void this.saveData(this.settings);
-    }
   }
 
-  /**
-   * Merkt sich die Docs-Erkennung einer Datei. Ein kürzerer Text (Ausschnitt
-   * aus einer verschachtelten Darstellung) überschreibt nie das Ergebnis aus
-   * der ganzen Datei.
-   * @param {string} path
-   * @param {string} text
-   * @param {boolean} flag
-   * @returns {boolean} gültige Erkennung für die Datei
-   */
-  rememberDocsFlag(path, text, flag) {
-    if (!path) return flag;
-    const prev = this.docsFlagByPath.get(path);
-    if (prev && prev.len > text.length) return prev.flag;
-    this.docsFlagByPath.set(path, { flag, len: text.length, mark: /<mark[\s>]/i.test(text) });
-    return flag;
-  }
+  /* ---------- Abschnitte: <details>, \( \[, %%, maskiertes HTML ---------- */
 
   /**
-   * <details>- und Kommentarbereiche eines Texts, je nach Einstellung.
+   * <details>- und Kommentarbereiche.
    * @param {string[]} lines
    * @param {boolean[]} mask
    */
   findRegions(lines, mask) {
-    const details = this.settings.renderDetails ? findDetailsRegions(lines, mask) : [];
-    const comments = this.settings.obsidianSyntaxAsText ? findCommentRegions(lines, mask) : [];
-    return { details, comments, regions: mergeRegions(details, comments) };
+    const comments = findCommentRegions(lines, mask);
+    return { comments, regions: mergeRegions(findDetailsRegions(lines, mask), comments) };
   }
-
-  /* ---------- Darstellung je Datei ---------- */
-
-  /**
-   * Obsidian-Einstellung „Strenge Zeilenumbrüche“. Nicht offizielle API,
-   * deshalb vorsichtig gelesen; null, wenn unbekannt.
-   * @returns {boolean | null}
-   */
-  obsidianStrictLineBreaks() {
-    try {
-      const vault = /** @type {any} */ (this.app.vault);
-      const value = typeof vault.getConfig === 'function' ? vault.getConfig('strictLineBreaks') : undefined;
-      return typeof value === 'boolean' ? value : null;
-    } catch (_e) {
-      return null;
-    }
-  }
-
-  /**
-   * @param {string} path
-   * @param {FileStyle} style
-   * @returns {BreakMode | null}
-   */
-  breakTransformFor(path, style) {
-    return breakTransform(resolveLineBreaks(this.settings, path, style), this.obsidianStrictLineBreaks());
-  }
-
-  /**
-   * Darstellung der Datei, zu der ein Block gehört.
-   * @param {HTMLElement} el
-   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
-   * @returns {Promise<FileStyle>}
-   */
-  async styleForContext(el, ctx) {
-    const path = ctx.sourcePath || '';
-    const own = this.settings.fileModes[path];
-    if (own && own.style) return own.style;
-    if (this.settings.renderMode === 'norm') return 'norm';
-    return (await this.isDocsContext(el, ctx)) ? 'docs' : 'chat';
-  }
-
-  /**
-   * Erkennung und Darstellung der Datei in einer Ansicht.
-   * @param {import('obsidian').MarkdownView} view
-   */
-  fileState(view) {
-    const path = view.file ? view.file.path : '';
-    const text = view.data || '';
-    const isDocs = isDocsExport(text, path, parseFolderList(this.settings.docsFolders));
-    /** @type {FileMode} */
-    const own = Object.assign({}, this.settings.fileModes[path]);
-    const auto = autoStyle(this.settings, isDocs);
-    const style = own.style || auto;
-    const autoBreaks = autoLineBreaks(this.settings, style);
-    const breaks = own.breaks || autoBreaks;
-    return { path, isDocs, own, auto, style, autoBreaks, breaks };
-  }
-
-  /**
-   * Setzt die eigene Einstellung einer Datei. undefined: zurück auf Standard.
-   * Gespeichert wird in den Plugin-Daten, nie in der Datei.
-   * @param {string} path
-   * @param {{ style?: FileStyle, breaks?: BreakMode }} patch
-   */
-  async setFileMode(path, patch) {
-    /** @type {FileMode} */
-    const next = Object.assign({}, this.settings.fileModes[path]);
-    if ('style' in patch) {
-      if (patch.style) next.style = patch.style;
-      else delete next.style;
-    }
-    if ('breaks' in patch) {
-      if (patch.breaks) next.breaks = patch.breaks;
-      else delete next.breaks;
-    }
-    if (next.style || next.breaks) this.settings.fileModes[path] = next;
-    else delete this.settings.fileModes[path];
-    await this.saveData(this.settings);
-    this.analysisByDoc.clear();
-    this.rerenderPath(path);
-  }
-
-  /**
-   * @param {boolean} checking
-   * @param {(view: import('obsidian').MarkdownView) => void} run
-   */
-  withActiveView(checking, run) {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view || !view.file) return false;
-    if (!checking) run(view);
-    return true;
-  }
-
-  /** @param {import('obsidian').MarkdownView} view */
-  async toggleNorm(view) {
-    const st = this.fileState(view);
-    /** @type {FileStyle} */
-    const target = st.style === 'norm' ? (st.isDocs ? 'docs' : 'chat') : 'norm';
-    await this.setFileMode(st.path, { style: target === st.auto ? undefined : target });
-    new Notice(`Darstellung: ${STYLE_LONG[target]}`);
-  }
-
-  /** @param {import('obsidian').MarkdownView} view */
-  async toggleLineBreaks(view) {
-    const st = this.fileState(view);
-    /** @type {BreakMode} */
-    const target = st.breaks === 'split' ? 'join' : 'split';
-    await this.setFileMode(st.path, { breaks: target === st.autoBreaks ? undefined : target });
-    new Notice(`Zeilenumbrüche: ${BREAKS_LONG[target]}`);
-  }
-
-  /**
-   * Menü „Darstellung dieser Datei“.
-   * @param {import('obsidian').MarkdownView} view
-   * @param {MouseEvent | null} evt
-   */
-  openModeMenu(view, evt) {
-    if (!view.file) return;
-    const st = this.fileState(view);
-    const menu = new Menu();
-    /** @param {string} title */
-    const label = (title) => menu.addItem((item) => item.setTitle(title).setIsLabel(true));
-    /**
-     * @param {string} title
-     * @param {boolean} checked
-     * @param {{ style?: FileStyle, breaks?: BreakMode }} patch
-     */
-    const choice = (title, checked, patch) =>
-      menu.addItem((item) =>
-        item
-          .setTitle(title)
-          .setChecked(checked)
-          .onClick(() => void this.setFileMode(st.path, patch))
-      );
-
-    label('Darstellung dieser Datei');
-    choice(`Automatisch (${STYLE_SHORT[st.auto]})`, !st.own.style, { style: undefined });
-    for (const style of FILE_STYLES) choice(STYLE_LONG[style], st.own.style === style, { style });
-    menu.addSeparator();
-    label('Einfache Zeilenumbrüche');
-    choice(`Automatisch (${BREAKS_SHORT[st.autoBreaks]})`, !st.own.breaks, { breaks: undefined });
-    for (const breaks of BREAK_MODES) choice(BREAKS_LONG[breaks], st.own.breaks === breaks, { breaks });
-    if (st.own.style || st.own.breaks) {
-      menu.addSeparator();
-      menu.addItem((item) =>
-        item
-          .setTitle('Diese Datei auf Standard zurücksetzen')
-          .setIcon('rotate-ccw')
-          .onClick(() => void this.setFileMode(st.path, { style: undefined, breaks: undefined }))
-      );
-    }
-
-    if (evt) {
-      menu.showAtMouseEvent(evt);
-      return;
-    }
-    const anchor = this.viewActions.get(view);
-    const box = (anchor && anchor.isConnected ? anchor : view.containerEl).getBoundingClientRect();
-    const pos = anchor && anchor.isConnected ? { x: box.left, y: box.bottom } : { x: box.left + box.width / 2, y: box.top + 48 };
-    menu.showAtPosition(pos, view.containerEl.ownerDocument);
-  }
-
-  /** Augen-Symbol oben rechts in jeder Markdown-Ansicht. */
-  refreshViewActions() {
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView) || this.viewActions.has(view)) return;
-      const btn = view.addAction('eye', 'Darstellung dieser Datei (Claude Markdown Viewer)', (evt) => this.openModeMenu(view, evt));
-      btn.addClass('cmv-view-action');
-      this.viewActions.set(view, btn);
-    });
-  }
-
-  /* ---------- Abschnitte: <details>, \( \[, Zeilenumbrüche ---------- */
 
   /**
    * @param {string} text
@@ -2256,24 +1501,28 @@ class ClaudeMarkdownViewer extends Plugin {
   analyze(text, docId, sourcePath) {
     const cached = this.analysisByDoc.get(docId);
     if (cached && cached.text === text) return cached;
-    const lines = splitLines(text);
+    const raw = splitLines(text);
+    const lines = prepareLines(raw);
     const mask = computeProtectedMask(lines);
-    const found = this.findRegions(lines, mask);
-    const isDocs = this.rememberDocsFlag(sourcePath, text, isDocsExport(text, sourcePath, parseFolderList(this.settings.docsFolders)));
-    const footnotes = collectFootnotes(lines, mask);
-    const analysis = {
-      text,
-      lines,
-      regions: found.regions,
-      hasDetails: found.details.length > 0,
-      hasComments: found.comments.length > 0,
-      isDocs,
-      footnotes,
-    };
+    const { regions, comments } = this.findRegions(lines, mask);
+    const analysis = { text, raw, lines, regions, hasComments: comments.length > 0, footnotes: collectFootnotes(lines, mask) };
     if (this.analysisByDoc.size > 50) this.analysisByDoc.clear();
     this.analysisByDoc.set(docId, analysis);
-    if (found.regions.length && sourcePath) this.pathsWithRegions.add(sourcePath);
+    if (regions.length && sourcePath) this.pathsWithRegions.add(sourcePath);
     return analysis;
+  }
+
+  /**
+   * @param {string} text ganze Datei
+   * @param {string} docId
+   */
+  fileNeedsWork(text, docId) {
+    const cached = this.quickCheckByDoc.get(docId);
+    if (cached && cached.text === text) return cached.hit;
+    const hit = /<details|\\\(|\\\[|%%|\\<|&#91;!/i.test(text);
+    if (this.quickCheckByDoc.size > 50) this.quickCheckByDoc.clear();
+    this.quickCheckByDoc.set(docId, { text, hit });
+    return hit;
   }
 
   /**
@@ -2290,25 +1539,11 @@ class ClaudeMarkdownViewer extends Plugin {
       info = null;
     }
     if (!info) return;
-    const s = this.settings;
-    const text = info.text;
-    const mayHaveDetails = s.renderDetails && /<details/i.test(text);
-    const mayHaveDelims = text.includes('\\(') || text.includes('\\[');
-    const mayHaveComments = s.obsidianSyntaxAsText && text.includes('%%');
-    const multiLine = info.lineEnd > info.lineStart;
-    if (!mayHaveDetails && !mayHaveDelims && !mayHaveComments && !multiLine) return;
-
+    // Schneller Ausschluss: nichts in der Datei, was umgebaut werden müsste.
+    if (!this.fileNeedsWork(info.text, ctx.docId)) return;
     try {
-      const a = this.analyze(text, ctx.docId, ctx.sourcePath);
-      const style = resolveStyle(s, ctx.sourcePath, a.isDocs);
-      const opts = {
-        details: mayHaveDetails && a.hasDetails,
-        comments: mayHaveComments && a.hasComments,
-        delims: mayHaveDelims && style === 'chat',
-        breaks: this.breakTransformFor(ctx.sourcePath, style),
-      };
-      if (!a.regions.length && !opts.comments && !opts.delims && !opts.breaks) return;
-      const res = buildSectionMarkdown(a.lines, info.lineStart, info.lineEnd, a.regions, opts);
+      const a = this.analyze(info.text, ctx.docId, ctx.sourcePath);
+      const res = buildSectionMarkdown(a.lines, a.raw, info.lineStart, info.lineEnd, a.regions, a.hasComments);
       if (!res.changed) return;
       if (res.markdown.trim() === '') {
         el.addClass('cmv-hidden');
@@ -2360,84 +1595,36 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {import('obsidian').MarkdownPostProcessorContext} ctx
    */
   processDom(el, ctx) {
-    const s = this.settings;
     try {
-      if (s.embedPlaceholders) decorateEmbedPlaceholders(el);
-      if (s.scrollableTables) wrapTables(el);
-      if (s.linkifyWww) linkifyWww(el);
-      if (s.obsidianSyntaxAsText) {
-        plainTags(el);
-        if (el.querySelector('mark')) this.unwrapHighlights(el, ctx);
-      }
+      decorateEmbedPlaceholders(el);
+      wrapTables(el);
+      this.resolveImages(el, (ctx && ctx.sourcePath) || '');
     } catch (err) {
       console.error(LOG_PREFIX, 'Fehler bei der Nachbearbeitung', err);
     }
   }
 
   /**
-   * ==Markierung== als Text, aber nur bei Chat/Code und Norm. In Docs-Exporten
-   * ist == eine echte Markierung. Enthält die Datei ein wörtliches <mark>-Tag,
-   * bleibt alles, wie es ist (im DOM nicht unterscheidbar).
-   * @param {HTMLElement} el
-   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
+   * <img src="bilder/a.png"> mit Pfad relativ zur Datei: Obsidian findet das
+   * Bild nicht selbst. Das Plugin sucht es im Vault und setzt die Adresse.
+   * @param {HTMLElement} root
+   * @param {string} sourcePath
    */
-  unwrapHighlights(el, ctx) {
-    const path = (ctx && ctx.sourcePath) || '';
-    let entry = this.docsFlagByPath.get(path);
-    if (!entry && ctx) {
-      /** @type {import('obsidian').MarkdownSectionInformation | null} */
-      let info = null;
-      try {
-        info = ctx.getSectionInfo(el);
-      } catch (_e) {
-        info = null;
+  resolveImages(root, sourcePath) {
+    const imgs = root.tagName === 'IMG' ? [root] : Array.from(root.querySelectorAll('img'));
+    for (const img of imgs) {
+      const src = img.getAttribute('src') || '';
+      const path = relativeImagePath(src, sourcePath);
+      if (!path) continue;
+      let file = this.app.vault.getAbstractFileByPath(normalizePath(path));
+      if (!(file instanceof TFile)) {
+        file = this.app.metadataCache.getFirstLinkpathDest(safeDecode(src.split(/[?#]/)[0]), sourcePath);
       }
-      if (info) {
-        this.rememberDocsFlag(path, info.text, isDocsExport(info.text, path, parseFolderList(this.settings.docsFolders)));
-        entry = this.docsFlagByPath.get(path);
-      }
+      if (file instanceof TFile) img.setAttribute('src', this.app.vault.getResourcePath(file));
     }
-    if (!entry || entry.mark) return;
-    if (resolveStyle(this.settings, path, entry.flag) === 'docs') return;
-    unwrapMarks(el);
   }
 
-  /* ---------- Claude-Docs-Erkennung ---------- */
-
-  /**
-   * @param {HTMLElement} el
-   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
-   * @returns {Promise<boolean>}
-   */
-  async isDocsContext(el, ctx) {
-    const folders = parseFolderList(this.settings.docsFolders);
-    const path = ctx.sourcePath || '';
-    if (inDocsFolder(path, folders)) return true;
-    /** @type {import('obsidian').MarkdownSectionInformation | null} */
-    let info = null;
-    try {
-      info = ctx.getSectionInfo(el);
-    } catch (_e) {
-      info = null;
-    }
-    if (info && info.lineStart >= 0) {
-      return this.rememberDocsFlag(path, info.text, isDocsExport(info.text, path, folders));
-    }
-    const cached = this.docsFlagByPath.get(path);
-    if (cached) return cached.flag;
-    const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
-    if (file instanceof TFile) {
-      try {
-        const text = await this.app.vault.cachedRead(file);
-        return this.rememberDocsFlag(path, text, isDocsExport(text, path, folders));
-      } catch (_e) {
-        return false;
-      }
-    }
-    return false;
-  }
-
-  /* ---------- Code als Code zeigen ---------- */
+  /* ---------- Code-Blöcke: immer dargestellt ---------- */
 
   /**
    * @param {HTMLElement} el
@@ -2466,64 +1653,6 @@ class ClaudeMarkdownViewer extends Plugin {
   }
 
   /**
-   * Block mit zwei Ansichten (z. B. Formel und Code). Ein Knopf oben rechts
-   * wechselt, ein zweiter kopiert den Quelltext. Nichts davon ändert die Datei.
-   * @param {HTMLElement} el
-   * @param {{ views: [SwitchView, SwitchView], initial: string, fallback: string, copyLabel: string, copy: () => string }} spec
-   */
-  async renderSwitchBlock(el, spec) {
-    el.addClass('cmv-block', 'cmv-switch');
-    /** @type {Map<string, { pane: HTMLElement, state: Promise<boolean> | null }>} */
-    const panes = new Map();
-    for (const v of spec.views) {
-      panes.set(v.id, { pane: el.createDiv({ cls: 'cmv-pane cmv-is-hidden', attr: { 'data-view': v.id } }), state: null });
-    }
-    /** @type {SwitchView} */
-    let current = spec.views[0];
-    /** @type {HTMLElement | null} */
-    let toggleBtn = null;
-
-    /** @param {SwitchView} v */
-    const ensure = (v) => {
-      const p = /** @type {{ pane: HTMLElement, state: Promise<boolean> | null }} */ (panes.get(v.id));
-      if (!p.state) {
-        p.state = v.render(p.pane).catch((err) => {
-          console.error(LOG_PREFIX, 'Ansicht konnte nicht erstellt werden', err);
-          return false;
-        });
-      }
-      return p.state;
-    };
-    /** @param {string} id */
-    const show = (id) => {
-      current = spec.views.find((v) => v.id === id) || spec.views[0];
-      const other = spec.views.find((v) => v !== current) || spec.views[1];
-      for (const [pid, p] of panes) p.pane.toggleClass('cmv-is-hidden', pid !== current.id);
-      el.setAttr('data-cmv-view', current.id);
-      if (toggleBtn) setButtonFace(toggleBtn, other.icon, other.label);
-      return ensure(current);
-    };
-
-    const bar = addToolbar(el, [
-      {
-        icon: 'repeat',
-        label: 'Ansicht wechseln',
-        onClick: () => {
-          const other = spec.views.find((v) => v !== current) || spec.views[1];
-          void show(other.id);
-        },
-      },
-      { icon: 'copy', label: spec.copyLabel, onClick: () => void copyText(spec.copy()) },
-    ]);
-    toggleBtn = /** @type {HTMLElement | null} */ (bar.querySelector('.cmv-toolbar-btn'));
-
-    const ok = await show(spec.initial);
-    if (!ok && spec.fallback !== spec.initial) await show(spec.fallback);
-  }
-
-  /* ---------- ```latex und ```math ---------- */
-
-  /**
    * Setzt TeX als Formel. false, wenn das nicht geht (Hinweis steht dann im Bereich).
    * @param {HTMLElement} pane
    * @param {string} tex
@@ -2533,7 +1662,7 @@ class ClaudeMarkdownViewer extends Plugin {
     try {
       await loadMathJax();
     } catch (_e) {
-      pane.createDiv({ cls: 'cmv-note', text: 'Formel-Engine nicht verfügbar. Den Quelltext zeigt der Umschalter oben rechts.' });
+      pane.createDiv({ cls: 'cmv-note', text: 'Formel-Engine nicht verfügbar. Darunter der Quelltext.' });
       return false;
     }
     const viewEl = pane.createDiv({ cls: 'cmv-math-view' });
@@ -2549,7 +1678,7 @@ class ClaudeMarkdownViewer extends Plugin {
       }
       if (!math || mathHasError(math)) {
         viewEl.remove();
-        pane.createDiv({ cls: 'cmv-note', text: 'Formel konnte nicht gesetzt werden. Den Quelltext zeigt der Umschalter oben rechts.' });
+        pane.createDiv({ cls: 'cmv-note', text: 'Formel konnte nicht gesetzt werden. Darunter der Quelltext.' });
         return false;
       }
       viewEl.createDiv({ cls: 'cmv-math-display' }).appendChild(math);
@@ -2563,162 +1692,67 @@ class ClaudeMarkdownViewer extends Plugin {
   }
 
   /**
-   * Claude Docs: ```latex als Formel. Claude-Chat/Code und Norm: als Code.
-   * ```math ist überall Formel (so zeigt es GitHub).
+   * ```latex und ```math als Formel. Ein ganzes LaTeX-Dokument (\documentclass
+   * usw.) lässt sich ohne LaTeX-Programm nicht setzen; es bleibt Quelltext.
    * @param {string} source
    * @param {HTMLElement} el
-   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
-   * @param {string} lang
    */
-  async renderTexBlock(source, el, ctx, lang) {
+  async renderTexBlock(source, el) {
     el.addClass('cmv-tex');
     const tex = stripTexDelimiters(source);
-    if (!tex || looksLikeLatexDocument(source)) {
-      el.addClass('cmv-block');
-      await this.renderPlainCode(el, source, 'latex');
+    if (!tex) return;
+    if (looksLikeLatexDocument(source)) {
+      await this.renderPlainCode(el, source, 'latex', { note: 'Ganzes LaTeX-Dokument: Obsidian kann es nicht setzen. Hier der Quelltext.' });
       return;
     }
-    const style = await this.styleForContext(el, ctx);
-    const formulaFirst = lang === 'math' || style === 'docs';
-    await this.renderSwitchBlock(el, {
-      views: [
-        { id: 'formula', icon: 'sigma', label: 'Als Formel zeigen', render: (pane) => this.renderFormulaInto(pane, tex) },
-        {
-          id: 'code',
-          icon: 'code',
-          label: 'Als Code zeigen',
-          render: async (pane) => {
-            await this.renderPlainCode(pane, source, 'latex', { copyButton: false });
-            return true;
-          },
-        },
-      ],
-      initial: formulaFirst ? 'formula' : 'code',
-      fallback: 'code',
-      copyLabel: 'TeX kopieren',
-      copy: () => source.trim(),
-    });
+    if (!(await this.renderFormulaInto(el, tex))) await this.renderPlainCode(el, source, 'latex');
   }
 
-  /* ---------- ```csv und ```tsv ---------- */
-
   /**
-   * Claude Docs: Tabelle. Claude-Chat/Code und Norm: Text.
+   * ```csv und ```tsv als Tabelle.
    * @param {string} source
    * @param {HTMLElement} el
-   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
    * @param {string} lang
    */
-  async renderCsvBlock(source, el, ctx, lang) {
+  async renderCsvBlock(source, el, lang) {
     el.addClass('cmv-csv');
-    const codeLang = lang === 'tsv' ? 'tsv' : 'csv';
     const rows = parseCsv(source, lang === 'tsv' ? '\t' : detectDelimiter(source));
-    if (rows.length === 0) {
-      el.addClass('cmv-block');
-      await this.renderPlainCode(el, source, codeLang);
-      return;
-    }
-    const style = await this.styleForContext(el, ctx);
-    await this.renderSwitchBlock(el, {
-      views: [
-        {
-          id: 'grid',
-          icon: 'table',
-          label: 'Als Tabelle zeigen',
-          render: async (pane) => {
-            renderCsvTable(pane, rows);
-            return true;
-          },
-        },
-        {
-          id: 'text',
-          icon: 'code',
-          label: 'Als Text zeigen',
-          render: async (pane) => {
-            await this.renderPlainCode(pane, source, codeLang, { copyButton: false });
-            return true;
-          },
-        },
-      ],
-      initial: style === 'docs' ? 'grid' : 'text',
-      fallback: 'text',
-      copyLabel: lang === 'tsv' ? 'TSV kopieren' : 'CSV kopieren',
-      copy: () => source,
-    });
+    if (rows.length === 0) return;
+    renderCsvTable(el, rows);
   }
 
-  /* ---------- ```markdown und ```md ---------- */
-
   /**
-   * Claude Docs: gerendertes Beispiel. Claude-Chat/Code und Norm: Quelltext.
+   * ```markdown und ```md als dargestelltes Beispiel.
    * @param {string} source
    * @param {HTMLElement} el
    * @param {import('obsidian').MarkdownPostProcessorContext} ctx
    */
   async renderMarkdownBlock(source, el, ctx) {
     el.addClass('cmv-mdblock');
-    const path = ctx.sourcePath || '';
-    const style = await this.styleForContext(el, ctx);
-    const startWithPreview = style === 'docs';
-
-    const header = el.createDiv({ cls: 'cmv-mdblock-header' });
-    header.createSpan({ cls: 'cmv-mdblock-label', text: 'Markdown' });
-    const tabs = header.createDiv({ cls: 'cmv-tabs', attr: { role: 'tablist' } });
-    const tabPreview = tabs.createEl('button', { cls: 'cmv-tab', text: 'Vorschau', attr: { type: 'button', role: 'tab' } });
-    const tabSource = tabs.createEl('button', { cls: 'cmv-tab', text: 'Quelltext', attr: { type: 'button', role: 'tab' } });
-    const copyBtn = header.createEl('button', { cls: 'cmv-toolbar-btn', attr: { type: 'button' } });
-    setButtonFace(copyBtn, 'copy', 'Markdown kopieren');
-
-    const body = el.createDiv({ cls: 'cmv-mdblock-body' });
-    const previewEl = body.createDiv({ cls: 'cmv-mdblock-preview' });
-    const sourceEl = body.createDiv({ cls: 'cmv-mdblock-source' });
     const child = new MarkdownRenderChild(el);
     ctx.addChild(child);
-    let previewDone = false;
-    let sourceDone = false;
+    try {
+      await MarkdownRenderer.render(this.app, transformMarkdown(source), el, ctx.sourcePath, child);
+    } catch (err) {
+      console.error(LOG_PREFIX, 'Markdown-Vorschau fehlgeschlagen', err);
+      el.empty();
+      await this.renderPlainCode(el, source, 'markdown');
+    }
+  }
 
-    /** @param {boolean} preview */
-    const show = async (preview) => {
-      tabPreview.toggleClass('is-active', preview);
-      tabSource.toggleClass('is-active', !preview);
-      tabPreview.setAttr('aria-selected', String(preview));
-      tabSource.setAttr('aria-selected', String(!preview));
-      previewEl.toggleClass('cmv-is-hidden', !preview);
-      sourceEl.toggleClass('cmv-is-hidden', preview);
-      if (preview && !previewDone) {
-        previewDone = true;
-        const md = transformMarkdown(source, {
-          details: this.settings.renderDetails,
-          delims: style === 'chat',
-          comments: this.settings.obsidianSyntaxAsText,
-          breaks: this.breakTransformFor(path, style),
-        });
-        try {
-          await MarkdownRenderer.render(this.app, md, previewEl, path, child);
-        } catch (err) {
-          console.error(LOG_PREFIX, 'Markdown-Vorschau fehlgeschlagen', err);
-          previewEl.setText('Vorschau nicht möglich.');
-        }
-      }
-      if (!preview && !sourceDone) {
-        sourceDone = true;
-        await this.renderPlainCode(sourceEl, source, 'markdown', { copyButton: false });
-      }
-    };
-    /** @param {MouseEvent} evt @param {boolean} preview */
-    const onTab = (evt, preview) => {
-      evt.preventDefault();
-      evt.stopPropagation();
-      void show(preview);
-    };
-    tabPreview.addEventListener('click', (evt) => onTab(evt, true));
-    tabSource.addEventListener('click', (evt) => onTab(evt, false));
-    copyBtn.addEventListener('click', (evt) => {
-      evt.preventDefault();
-      evt.stopPropagation();
-      void copyText(source);
-    });
-    await show(startWithPreview);
+  /**
+   * ```svg als Bild.
+   * @param {string} source
+   * @param {HTMLElement} el
+   */
+  async renderSvgBlock(source, el) {
+    const url = svgDataUrl(source);
+    if (!url) {
+      await this.renderPlainCode(el, source, 'svg');
+      return;
+    }
+    el.addClass('cmv-svg');
+    el.createEl('img', { attr: { src: url, alt: 'SVG-Grafik' } });
   }
 
   /* ---------- Links: GitHub-Anker, keine neuen Notizen ---------- */
@@ -2753,8 +1787,8 @@ class ClaudeMarkdownViewer extends Plugin {
     const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
     if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;
     try {
-      if (this.settings.githubAnchors && href.includes('#') && this.tryResolveAnchor(evt, a, href)) return;
-      if (this.settings.blockUnresolvedLinks && a.classList.contains('is-unresolved')) {
+      if (href.includes('#') && this.tryResolveAnchor(evt, a, href)) return;
+      if (this.settings.viewOnly && a.classList.contains('is-unresolved')) {
         this.stopEvent(evt);
         new Notice(`Link-Ziel nicht im Vault: ${safeDecode(href)}`);
       }
@@ -2787,7 +1821,9 @@ class ClaudeMarkdownViewer extends Plugin {
       // Liegt das Ziel in einem Klapp- oder Kommentarbereich, steckt die
       // Überschrift im ersten Abschnitt des Bereichs; ihr eigener Abschnitt ist
       // ausgeblendet. Dann im DOM suchen statt über die Zeile springen.
-      const lines = splitLines(text);
+      // prepareLines wie in analyze(), sonst fehlen maskierte \<details> aus
+      // Docs-Exporten.
+      const lines = prepareLines(splitLines(text));
       const region = this.findRegions(lines, computeProtectedMask(lines)).regions.find(
         (r) => r.start <= target.line && target.line <= r.end
       );
@@ -2881,151 +1917,37 @@ class ViewerSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     const plugin = this.plugin;
-
-    /**
-     * @param {keyof ViewerSettings} key
-     * @param {string} name
-     * @param {string} desc
-     */
-    const toggle = (key, name, desc) => {
-      new Setting(containerEl)
-        .setName(name)
-        .setDesc(desc)
-        .addToggle((t) =>
-          t.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
-            /** @type {any} */ (plugin.settings)[key] = value;
-            await plugin.saveSettings();
-          })
-        );
-    };
-
-    new Setting(containerEl).setName('Darstellung: wie Claude oder nach Norm').setHeading();
     new Setting(containerEl)
-      .setName('Standard-Darstellung')
+      .setName('Nur ansehen')
       .setDesc(
-        'Wie Claude: Docs-Exporte wie in Claude Docs (```latex als Formel, ```csv als Tabelle, ```markdown als gerendertes Beispiel), alle anderen Dateien wie im Claude-Chat (\\(…\\) und \\[…\\] als Formel). Norm: wie auf GitHub, diese Blöcke als Code, \\( und \\[ als Text. Einzelne Dateien stellst du über das Augen-Symbol oben rechts um, einzelne Blöcke über ihren Umschalter.'
+        'Markdown-Dateien öffnen immer in der Leseansicht; ein Wechsel zum Bearbeiten wird sofort zurückgenommen. Checkboxen und Eigenschaften sind nicht änderbar, Links zu fehlenden Dateien legen keine Notiz an. Ausschalten, um ausnahmsweise in Obsidian zu bearbeiten.'
       )
-      .addDropdown((d) =>
-        d
-          .addOption('claude', 'Wie Claude (automatisch)')
-          .addOption('norm', 'Norm (wie GitHub)')
-          .setValue(plugin.settings.renderMode)
-          .onChange(async (value) => {
-            plugin.settings.renderMode = value === 'norm' ? 'norm' : 'claude';
-            await plugin.saveSettings();
-          })
+      .addToggle((t) =>
+        t.setValue(plugin.settings.viewOnly).onChange(async (value) => {
+          plugin.settings.viewOnly = value;
+          await plugin.saveSettings();
+        })
       );
-    new Setting(containerEl)
-      .setName('Einfache Zeilenumbrüche')
-      .setDesc(
-        'Ein einzelner Zeilenumbruch ohne Leerzeile ist nach der Norm nur ein Leerzeichen: die Zeilen bilden einen Absatz. Bei Claude beginnt dort eine neue Zeile. Automatisch: wie Claude getrennt, bei Norm zusammen. Die Obsidian-Einstellung „Strenge Zeilenumbrüche“ musst du dafür nicht ändern.'
-      )
-      .addDropdown((d) =>
-        d
-          .addOption('auto', 'Automatisch')
-          .addOption('split', 'Immer getrennt')
-          .addOption('join', 'Immer zusammen (Norm)')
-          .setValue(plugin.settings.lineBreaks)
-          .onChange(async (value) => {
-            plugin.settings.lineBreaks = value === 'split' || value === 'join' ? value : 'auto';
-            await plugin.saveSettings();
-          })
-      );
-    new Setting(containerEl)
-      .setName('Ordner mit Docs-Exporten')
-      .setDesc(
-        'Optional, kommagetrennt, z. B. „Claude/Docs“. Dateien darin gelten immer als Docs-Export. Ohne Angabe erkennt das Plugin Exporte an der Datumszeile unter dem Titel und an Diagramm-Platzhaltern.'
-      )
-      .addText((t) => {
-        // Erst speichern und neu darstellen, wenn eine Weile nichts getippt wurde.
-        const saveSoon =
-          typeof debounce === 'function' ? debounce(() => void plugin.saveSettings(), 800, true) : () => void plugin.saveSettings();
-        t.setPlaceholder('Claude/Docs')
-          .setValue(plugin.settings.docsFolders)
-          .onChange((value) => {
-            plugin.settings.docsFolders = value;
-            saveSoon();
-          });
-      });
-    const count = Object.keys(plugin.settings.fileModes).length;
-    new Setting(containerEl)
-      .setName('Dateien mit eigener Darstellung')
-      .setDesc(
-        count === 0
-          ? 'Keine. Gespeichert wird in den Plugin-Daten, nicht in den Dateien.'
-          : `${count} ${count === 1 ? 'Datei' : 'Dateien'}. Gespeichert in den Plugin-Daten, nicht in den Dateien.`
-      )
-      .addButton((b) =>
-        b
-          .setButtonText('Alle zurücksetzen')
-          .setDisabled(count === 0)
-          .onClick(async () => {
-            plugin.settings.fileModes = {};
-            await plugin.saveSettings();
-            this.display();
-          })
-      );
-
-    new Setting(containerEl).setName('Nur ansehen, nie ändern').setHeading();
-    toggle(
-      'lockReadingView',
-      'Immer Leseansicht',
-      'Markdown-Dateien öffnen in der Leseansicht. Ein Wechsel in den Bearbeitungsmodus wird sofort zurückgenommen. Eigenschaften (Frontmatter) sind nur sichtbar, nicht änderbar. Das Plugin selbst hat keine Bearbeitungsfunktionen, auch nicht für Tabellen.'
-    );
-    toggle(
-      'readOnlyCheckboxes',
-      'Checkboxen nicht anklickbar',
-      'Ein Klick oder die Leertaste auf einer Aufgaben-Checkbox würde sonst die Datei ändern.'
-    );
-    toggle(
-      'blockUnresolvedLinks',
-      'Keine Notizen durch Link-Klick anlegen',
-      'Obsidian legt beim Klick auf einen Link zu einer fehlenden Datei eine neue Notiz an, auch über das Kontextmenü. Stattdessen erscheint ein Hinweis.'
-    );
-
-    new Setting(containerEl).setName('Zusätzlich, in jeder Darstellung').setHeading();
-    toggle(
-      'obsidianSyntaxAsText',
-      'Obsidian-Sonderzeichen als Text',
-      'Claude kennt diese Obsidian-Syntax nicht: Text zwischen zwei %% blendet Obsidian als Kommentar aus, #wort wird ein Tag, ==wort== eine Markierung. Eingeschaltet steht der Text da wie geschrieben. ==Markierung== bleibt bei Docs-Exporten erhalten.'
-    );
-    toggle('renderDetails', '<details> ausklappbar mit Markdown-Inhalt', 'Auch mit Leerzeilen, Code, Tabellen und Verschachtelung.');
-    toggle('githubAnchors', 'GitHub-Ankerlinks auflösen', 'Links wie [Abschnitt](#mein-abschnitt) springen zur passenden Überschrift.');
-    toggle('embedPlaceholders', 'Diagramm-Platzhalter hervorheben', 'Docs-Exporte enthalten statt Charts nur „[embedded content: …]“.');
-    toggle('scrollableTables', 'Breite Tabellen scrollbar', 'Statt über den Rand zu laufen.');
-    toggle('githubAlertColors', 'GitHub-Farben für Hinweisboxen', 'IMPORTANT violett, CAUTION rot statt der Obsidian-Standardfarben.');
-    toggle(
-      'linkifyWww',
-      'www.-Adressen verlinken',
-      'Wie GitHub bei Adressen ohne https://. Aktuelle Obsidian-Versionen tun das selbst; das Plugin ergänzt es nur, wo es fehlt.'
-    );
   }
 }
 
 /* Nur für Tests: reine Funktionen. Obsidian ignoriert diese Eigenschaft. */
 /** @type {any} */ (ClaudeMarkdownViewer).__test = {
   splitLines,
-  frontmatterEnd,
   computeFenceMask,
+  computeProtectedMask,
   findInlineCodeRanges,
   convertMathDelimiters,
   convertDetailsInText,
   detailsBlockToCallout,
   findDetailsRegions,
-  computeProtectedMask,
-  buildSectionMarkdown,
+  findCommentRegions,
+  escapeComments,
+  mergeRegions,
+  unescapeHtmlLine,
+  prepareLines,
   transformMarkdown,
-  convertSoftBreaks,
-  computeBreakProtection,
-  splitQuote,
-  sanitizeFileModes,
-  autoStyle,
-  resolveStyle,
-  autoLineBreaks,
-  resolveLineBreaks,
-  breakTransform,
-  moveFileModes,
-  AUTO_BREAKS,
+  buildSectionMarkdown,
   collectFootnotes,
   githubSlug,
   headingPlainText,
@@ -3033,8 +1955,6 @@ class ViewerSettingTab extends PluginSettingTab {
   makeHeadingIndex,
   resolveAnchor,
   linkSafeHeading,
-  isDocsExport,
-  parseFolderList,
   looksLikeLatexDocument,
   stripTexDelimiters,
   splitTexChunks,
@@ -3042,17 +1962,11 @@ class ViewerSettingTab extends PluginSettingTab {
   detectDelimiter,
   parseCsv,
   numericColumns,
+  relativeImagePath,
+  svgDataUrl,
   decorateEmbedPlaceholders,
   wrapTables,
-  linkifyWww,
   decorateFootnoteRefs,
-  findCommentRegions,
-  escapeComments,
-  mergeRegions,
-  listItemBreaksParagraph,
-  inDocsFolder,
-  plainTags,
-  unwrapMarks,
   DEFAULT_SETTINGS,
 };
 
