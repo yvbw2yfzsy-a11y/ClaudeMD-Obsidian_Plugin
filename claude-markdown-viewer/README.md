@@ -53,9 +53,18 @@ Zum ausnahmsweisen Bearbeiten in Obsidian die Einstellung ausschalten.
 - Einfache Zeilenumbrüche regelt Obsidians Einstellung „Strenge Zeilenumbrüche“. Aus (Standard) zeigt Zeilen wie Claude untereinander.
 - Belegt ein anderes Plugin die Code-Blöcke `latex`, `math`, `csv`, `tsv`, `markdown`, `md` oder `svg`, meldet das Plugin das beim Start und lässt diese Blöcke aus.
 - Ein Link aus einer anderen Datei auf eine Überschrift in einem Klappbereich landet am Anfang des Bereichs.
+- `<details>` wird nur erkannt, wenn es höchstens drei Leerzeichen eingerückt ist. In tiefer verschachtelten Listen und in Zitaten (`> <details>`) bleibt es, wie Obsidian es zeigt.
+- Eingerückte Code-Blöcke (vier Leerzeichen statt ```` ``` ````) schützt das Plugin nicht: `\(…\)`, maskierte Tags und `%%` werden dort mit umgebaut.
 - Nicht zusammen mit „LaTeX Delimiter Renderer“ oder „Details Markdown“ verwenden: beide machen Teile davon und würden doppelt eingreifen.
 
 ## Änderungen
+
+**2.0.1**
+
+- Behoben: Ein Ankerlink auf eine Überschrift in einem maskierten Klappbereich aus einem Docs-Export (`\<details>`) sprang in den ausgeblendeten Abschnitt.
+- Behoben: Fußnoten-Nummern zählten Verweise ohne Definition mit (`[^x]` ohne `[^x]:`); danach stimmten Nummer und Sprungziel nicht.
+- Behoben: Code-Block `svg` mit `<!DOCTYPE svg …>` erschien als Code statt als Grafik. Fehlte `xmlns` am `<svg>`-Tag, stand aber weiter innen oder in einem Kommentar davor, blieb das Bild leer.
+- Schneller bei großen Dateien ohne Umbau: Der Schnelltest läuft einmal je Datei statt einmal je Abschnitt.
 
 **2.0.0**
 

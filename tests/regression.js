@@ -149,6 +149,15 @@ test('processSection: Docs-Zeile mit maskierten Tags wird neu dargestellt', asyn
   assert.strictEqual(sec.el.rendered, 'Normaler Text, <u>unterstrichen</u>, H<sub>2</sub>O, Prozent 50 %% sowie \\[\\[Wikilink\\]\\].');
 });
 
+test('Schnelltest je Datei: Merker liefert dasselbe wie der Test', () => {
+  const p = newPlugin();
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+  assert.strictEqual(p.fileNeedsWork('mit \\(x\\)', 'd'), true);
+  assert.strictEqual(p.fileNeedsWork('mit <DETAILS>', 'e'), true);
+  assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
+});
+
 test('processSection: Abschnitt ohne Umbau bleibt, wie Obsidian ihn zeigt', async () => {
   const text = '# T\n\nNur Text mit \\(x\\) weiter unten.\n\nKein Umbau hier.\n';
   const sec = fakeSection(4, 4, text);
@@ -210,6 +219,21 @@ test('SVG wird data:-Bild, anderes nicht', () => {
   assert.strictEqual(T.svgDataUrl('<div>kein svg</div>'), null);
 });
 
+test('SVG mit DOCTYPE wird Bild; xmlns kommt an das <svg>-Tag selbst', () => {
+  const dec = (u) => decodeURIComponent(u.slice(u.indexOf(',') + 1));
+  const doctype = T.svgDataUrl('<?xml version="1.0"?>\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd">\n<svg width="1"><rect/></svg>');
+  assert.ok(doctype && dec(doctype).includes('<svg xmlns="http://www.w3.org/2000/svg" width="1">'));
+  // Kommentar davor mit „<svg“: nicht dort einfügen, sondern am echten Tag.
+  assert.strictEqual(dec(T.svgDataUrl('<!-- <svg> -->\n<svg><rect/></svg>')), '<!-- <svg> -->\n<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>');
+  // xmlns nur weiter innen: das <svg>-Tag braucht trotzdem eines.
+  assert.ok(dec(T.svgDataUrl('<svg><g><div xmlns="http://www.w3.org/1999/xhtml"/></g></svg>')).startsWith('<svg xmlns="http://www.w3.org/2000/svg">'));
+  // Vorhandenes xmlns bleibt unverändert.
+  const own = '<svg\n  xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>';
+  assert.strictEqual(dec(T.svgDataUrl(own)), own);
+  // DOCTYPE mit eigenen Entity-Definitionen bleibt Code.
+  assert.strictEqual(T.svgDataUrl('<!DOCTYPE svg [<!ENTITY a "b">]>\n<svg/>'), null);
+});
+
 test('Bildpfade relativ zur Datei', () => {
   assert.strictEqual(T.relativeImagePath('bilder/a.png', 'repo/docs/README.md'), 'repo/docs/bilder/a.png');
   assert.strictEqual(T.relativeImagePath('../img/a%20b.png?x=1', 'repo/docs/README.md'), 'repo/img/a b.png');
@@ -246,11 +270,17 @@ test('Mehrzeilige Fußnote: ganzer Text im Tooltip', () => {
   assert.strictEqual(T.collectFootnotes(lines, new Array(lines.length).fill(false)).defs.get('a'), 'Erste Zeile zweite Zeile zweiter Absatz');
 });
 
+test('Fußnoten-Nummern zählen nur Verweise mit Definition', () => {
+  const lines = ['Erst [^x], dann [^b] und [^a], wieder [^b].', '', '[^a]: A', '[^b]: B'];
+  const fn = T.collectFootnotes(lines, new Array(lines.length).fill(false));
+  assert.deepStrictEqual([...fn.order], [['b', 1], ['a', 2]]);
+});
+
 /* ---------- Klick-Handler ---------- */
 
-/** @param {{ href: string, classes: string[] }} spec */
+/** @param {{ href: string, classes: string[], data?: string }} spec */
 function clickOn(spec) {
-  const container = { contains: () => true };
+  const container = { contains: () => true, querySelector: () => null, querySelectorAll: () => [] };
   const a = {
     classList: { contains: (c) => spec.classes.includes(c) },
     getAttribute: (name) => (name === 'href' ? spec.href : null),
@@ -261,7 +291,7 @@ function clickOn(spec) {
   Object.assign(view, {
     containerEl: container,
     file: { path: 'a.md', name: 'a.md', basename: 'a' },
-    data: '# A\n\nTags: #test\n\n## Test\n',
+    data: spec.data || '# A\n\nTags: #test\n\n## Test\n',
     getViewData() {
       return this.data;
     },
@@ -284,6 +314,16 @@ test('Klick auf Ankerlink #test springt zur Überschrift', () => {
   const r = clickOn({ href: '#test', classes: ['internal-link'] });
   assert.strictEqual(r.prevented, true);
   assert.strictEqual(r.scrolledTo, 4);
+});
+
+test('Ankerlink in maskierten Docs-Klappbereich springt zum Anfang des Bereichs', () => {
+  const data = '# A\n\n\\<details>&#10;\\<summary>Mehr\\</summary>\n\n## Innen\n\nText\n\n\\</details>\n';
+  // Überschrift nicht im DOM: Sprung zur ersten Zeile des Bereichs, nicht in den
+  // ausgeblendeten Abschnitt (Zeile 4).
+  assert.deepStrictEqual(clickOn({ href: '#innen', classes: ['internal-link'], data }), { prevented: true, scrolledTo: 2 });
+  // Auch die exakte Schreibweise übernimmt das Plugin, weil Obsidian sonst in
+  // den ausgeblendeten Abschnitt springt.
+  assert.deepStrictEqual(clickOn({ href: '#Innen', classes: ['internal-link'], data }), { prevented: true, scrolledTo: 2 });
 });
 
 /* ---------- Nur ansehen ---------- */

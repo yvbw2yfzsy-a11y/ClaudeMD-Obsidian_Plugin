@@ -2,6 +2,22 @@
 
 Geprüft wurden `main.js`, `styles.css`, `manifest.json` und `README.md` aus `claude-markdown-viewer-1.1.0.zip` sowie die drei Testdateien. Eine Anleitung, ein Prüfbericht oder die ursprüngliche Anfrage lagen nicht bei und sind deshalb nicht geprüft. Behauptungen in README und Code-Kommentaren wurden als Behauptungen behandelt.
 
+## Stand 2.0.1: Prüfung von 2.0.0
+
+Geprüft: `main.js`, `styles.css`, `manifest.json`, `README.md`, `tests/regression.js` vom Zweig mit 2.0.0. Die Testdateien („Claude Test 1/2“, `claude-test-linkziel.md`) lagen nicht vor.
+
+Ausgeführt: Regressionstests; Typprüfung `tsc --checkJs --strict` gegen `obsidian.d.ts` 1.14.4 (aktuell) und 1.5.7 (passend zu `minAppVersion` 1.5.0), beide 0 Fehler, auch mit `--noUnusedLocals`; Vergleich alter und neuer Funktionen auf 60 000 Zufallseingaben (300 000 Vergleiche, 0 Abweichungen); SVG-Bilder in Chromium (Playwright); Slugs gegen `github-slugger@2`; Laufzeit von `processSection` an einer 1-MB-Datei.
+
+Behoben (je mit Regressionstest, der gegen 2.0.0 fehlschlägt):
+
+- Ankerlink auf eine Überschrift in einem maskierten Docs-Klappbereich (`\<details>`): `tryResolveAnchor` suchte die Bereiche in den unvorbereiteten Zeilen und fand den Bereich nicht. Sprung ging in den ausgeblendeten Abschnitt.
+- Fußnoten-Nummern zählten Verweise ohne Definition mit.
+- `svg` mit `<!DOCTYPE svg …>` blieb Code. `xmlns` wurde in einen Kommentar vor dem Tag eingefügt bzw. fehlte, wenn ein `xmlns` nur weiter innen stand; Chromium zeigt ein SVG ohne `xmlns` am Wurzel-Tag nicht an.
+- Schnelltest je Abschnitt lief über die ganze Datei (quadratisch). Jetzt einmal je Datei: 1-MB-Datei ohne Umbau 4011 ms → 8 ms.
+- Doppelte Logik zusammengefasst (`mapOutsideCodeBlocks`, `mapOutsideInlineCode`), Verhalten per Zufallsvergleich gleich.
+
+Offen, mit Rückfrage an den Nutzer: maskiertes `\<details>` mitten im Satz versteckt den Rest des Absatzes; `\[1\]` allein auf einer Zeile wird Formel; eingerückte Code-Blöcke werden mit umgebaut; Dateiänderung, die erst einen Bereich entstehen lässt, stellt nicht alles neu dar; weitere Punkte im Chat-Bericht.
+
 ## Stand 2.0.0: nur noch eine Darstellung
 
 Auf Wunsch gibt es nur noch eine Darstellung, die immer alles fertig zeigt. Entfernt wurden die drei Darstellungen (wie Claude Docs, wie Claude-Chat, Norm), Augen-Symbol, Befehle, Block-Umschalter, Docs-Erkennung, eigene Zeilenumbruch-Logik (Obsidian-Einstellung „Strenge Zeilenumbrüche“ regelt das), `www.`-Verlinkung (Obsidian verlinkt selbst, in der Leseansicht am iPad gesehen), Tags und `==` als Text, alle Einstellungen außer „Nur ansehen“. `main.js` schrumpft von rund 3060 auf rund 1950 Zeilen.

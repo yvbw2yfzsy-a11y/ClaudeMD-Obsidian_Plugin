@@ -158,7 +158,8 @@ function findInlineCodeRanges(text) {
 }
 
 /**
- * Entfernt Inline-Code aus einer Zeile (für Tag- und Fußnotensuche).
+ * Entfernt Inline-Code aus einer Zeile (für die Suche nach <details>-Tags,
+ * %% und Fußnoten).
  * @param {string} line
  */
 function stripInlineCode(line) {
@@ -183,6 +184,53 @@ function isEscapedAt(text, index) {
   let n = 0;
   for (let i = index - 1; i >= 0 && text[i] === '\\'; i--) n++;
   return n % 2 === 1;
+}
+
+/**
+ * Wendet `fn` nur auf die Teile außerhalb von Inline-Code an; Code bleibt.
+ * @param {string} text
+ * @param {(part: string) => string} fn
+ */
+function mapOutsideInlineCode(text, fn) {
+  let out = '';
+  let last = 0;
+  for (const [a, b] of findInlineCodeRanges(text)) {
+    out += fn(text.slice(last, a)) + text.slice(a, b);
+    last = b;
+  }
+  return out + fn(text.slice(last));
+}
+
+/**
+ * Wendet `fn` auf zusammenhängende Textstücke außerhalb von Code-Blöcken (und
+ * am Dateianfang außerhalb des Frontmatters) an. Geschützte Zeilen bleiben.
+ * @param {string} md
+ * @param {boolean} withFrontmatter
+ * @param {(chunk: string) => string} fn
+ */
+function mapOutsideCodeBlocks(md, withFrontmatter, fn) {
+  const lines = md.split('\n');
+  const mask = computeProtectedMask(lines, withFrontmatter);
+  /** @type {string[]} */
+  const out = [];
+  /** @type {string[]} */
+  let buf = [];
+  const flush = () => {
+    if (buf.length) {
+      out.push(fn(buf.join('\n')));
+      buf = [];
+    }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) {
+      flush();
+      out.push(lines[i]);
+    } else {
+      buf.push(lines[i]);
+    }
+  }
+  flush();
+  return out.join('\n');
 }
 
 /** @param {string} s */
@@ -306,28 +354,7 @@ function convertMathChunk(text) {
  */
 function convertMathDelimiters(md, withFrontmatter = true) {
   if (md.indexOf('\\(') === -1 && md.indexOf('\\[') === -1) return md;
-  const lines = md.split('\n');
-  const mask = computeProtectedMask(lines, withFrontmatter);
-  /** @type {string[]} */
-  const out = [];
-  /** @type {string[]} */
-  let buf = [];
-  const flush = () => {
-    if (buf.length) {
-      out.push(convertMathChunk(buf.join('\n')));
-      buf = [];
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) {
-      flush();
-      out.push(lines[i]);
-    } else {
-      buf.push(lines[i]);
-    }
-  }
-  flush();
-  return out.join('\n');
+  return mapOutsideCodeBlocks(md, withFrontmatter, convertMathChunk);
 }
 
 /* ---------- <details>/<summary> ---------- */
@@ -506,14 +533,7 @@ function findCommentRegions(lines, mask) {
  * @param {string} text Textstück ohne Code-Blöcke
  */
 function escapeCommentChunk(text) {
-  const code = findInlineCodeRanges(text);
-  let out = '';
-  let last = 0;
-  for (const [a, b] of code) {
-    out += text.slice(last, a).replace(/%%/g, '&#37;&#37;') + text.slice(a, b);
-    last = b;
-  }
-  return out + text.slice(last).replace(/%%/g, '&#37;&#37;');
+  return mapOutsideInlineCode(text, (part) => part.replace(/%%/g, '&#37;&#37;'));
 }
 
 /**
@@ -522,28 +542,7 @@ function escapeCommentChunk(text) {
  */
 function escapeComments(md, withFrontmatter = true) {
   if (md.indexOf('%%') === -1) return md;
-  const lines = md.split('\n');
-  const mask = computeProtectedMask(lines, withFrontmatter);
-  /** @type {string[]} */
-  const out = [];
-  /** @type {string[]} */
-  let buf = [];
-  const flush = () => {
-    if (buf.length) {
-      out.push(escapeCommentChunk(buf.join('\n')));
-      buf = [];
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) {
-      flush();
-      out.push(lines[i]);
-    } else {
-      buf.push(lines[i]);
-    }
-  }
-  flush();
-  return out.join('\n');
+  return mapOutsideCodeBlocks(md, withFrontmatter, escapeCommentChunk);
 }
 
 /**
@@ -592,16 +591,9 @@ function unescapeHtmlSegment(text) {
  * @param {string} line
  */
 function unescapeHtmlLine(line) {
-  let out = line.replace(ESCAPED_ALERT_RE, '$1[!$2]');
+  const out = line.replace(ESCAPED_ALERT_RE, '$1[!$2]');
   if (out.indexOf('\\<') === -1) return out;
-  const code = findInlineCodeRanges(out);
-  let res = '';
-  let last = 0;
-  for (const [a, b] of code) {
-    res += unescapeHtmlSegment(out.slice(last, a)) + out.slice(a, b);
-    last = b;
-  }
-  return res + unescapeHtmlSegment(out.slice(last));
+  return mapOutsideInlineCode(out, unescapeHtmlSegment);
 }
 
 /**
@@ -694,8 +686,8 @@ function buildSectionMarkdown(lines, raw, lineStart, lineEnd, regions, hasCommen
 function collectFootnotes(lines, mask) {
   /** @type {Map<string, string>} */
   const defs = new Map();
-  /** @type {Map<string, number>} */
-  const order = new Map();
+  /** @type {string[]} Verweise in der Reihenfolge ihres ersten Auftretens */
+  const refs = [];
   const defRe = /^\[\^([^\]\s]+)\]:\s?(.*)$/;
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
@@ -718,9 +710,14 @@ function collectFootnotes(lines, mask) {
     const refRe = /\[\^([^\]\s]+)\](?!:)/g;
     const line = stripInlineCode(lines[i]);
     let m;
-    while ((m = refRe.exec(line)) !== null) {
-      if (!order.has(m[1])) order.set(m[1], order.size + 1);
-    }
+    while ((m = refRe.exec(line)) !== null) refs.push(m[1]);
+  }
+  // Nummeriert werden nur Verweise mit Definition: Ein [^x] ohne Definition
+  // bleibt Text und bekommt keine Nummer (wie bei GitHub und markdown-it).
+  /** @type {Map<string, number>} */
+  const order = new Map();
+  for (const id of refs) {
+    if (defs.has(id) && !order.has(id)) order.set(id, order.size + 1);
   }
   return { defs, order };
 }
@@ -1212,8 +1209,16 @@ function relativeImagePath(src, sourcePath) {
  */
 function svgDataUrl(source) {
   const s = source.trim();
-  if (!/^(?:<\?xml[\s\S]*?\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(s)) return null;
-  const withNs = /xmlns=/.test(s) ? s : s.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  // Vor dem <svg>-Tag erlaubt: XML-Deklaration, Kommentare, DOCTYPE (ohne
+  // eigene Entity-Definitionen in [ … ]).
+  const m = /^(?:<\?xml[\s\S]*?\?>\s*)?(?:<!--[\s\S]*?-->\s*|<!DOCTYPE\s+svg\b[^>[]*>\s*)*<svg(?=[\s>])/i.exec(s);
+  if (!m) return null;
+  // Ohne xmlns am <svg>-Tag selbst zeigt der Browser das Bild nicht an.
+  // Geprüft wird nur dieses Tag, nicht ein xmlns weiter innen oder in einem
+  // Kommentar davor.
+  const at = m[0].length;
+  const rootTag = s.slice(at, s.indexOf('>', at) + 1);
+  const withNs = /\sxmlns\s*=/.test(rootTag) ? s : s.slice(0, at) + ' xmlns="http://www.w3.org/2000/svg"' + s.slice(at);
   return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(withNs);
 }
 
@@ -1228,6 +1233,14 @@ class ClaudeMarkdownViewer extends Plugin {
   /** Analyse der ganzen Datei je Darstellung (docId). */
   /** @type {Map<string, { text: string, raw: string[], lines: string[], regions: Region[], hasComments: boolean, footnotes: { defs: Map<string, string>, order: Map<string, number> } }>} */
   analysisByDoc = new Map();
+
+  /**
+   * Ergebnis des Schnelltests je Darstellung (docId): Enthält die Datei
+   * überhaupt etwas, das umgebaut werden müsste? Ohne Merker liefe der Test
+   * für jeden Abschnitt über die ganze Datei.
+   * @type {Map<string, { text: string, hit: boolean }>}
+   */
+  quickCheckByDoc = new Map();
 
   /** Pfade, deren Darstellung Mehrabschnitts-Blöcke (<details>, %%) enthält. */
   /** @type {Set<string>} */
@@ -1436,6 +1449,7 @@ class ClaudeMarkdownViewer extends Plugin {
 
   rerenderAll() {
     this.analysisByDoc.clear();
+    this.quickCheckByDoc.clear();
     for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
       const view = leaf.view;
       if (view instanceof MarkdownView && view.previewMode) view.previewMode.rerender(true);
@@ -1499,6 +1513,19 @@ class ClaudeMarkdownViewer extends Plugin {
   }
 
   /**
+   * @param {string} text ganze Datei
+   * @param {string} docId
+   */
+  fileNeedsWork(text, docId) {
+    const cached = this.quickCheckByDoc.get(docId);
+    if (cached && cached.text === text) return cached.hit;
+    const hit = /<details|\\\(|\\\[|%%|\\<|&#91;!/i.test(text);
+    if (this.quickCheckByDoc.size > 50) this.quickCheckByDoc.clear();
+    this.quickCheckByDoc.set(docId, { text, hit });
+    return hit;
+  }
+
+  /**
    * @param {HTMLElement} el
    * @param {import('obsidian').MarkdownPostProcessorContext} ctx
    */
@@ -1513,7 +1540,7 @@ class ClaudeMarkdownViewer extends Plugin {
     }
     if (!info) return;
     // Schneller Ausschluss: nichts in der Datei, was umgebaut werden müsste.
-    if (!/<details|\\\(|\\\[|%%|\\<|&#91;!/i.test(info.text)) return;
+    if (!this.fileNeedsWork(info.text, ctx.docId)) return;
     try {
       const a = this.analyze(info.text, ctx.docId, ctx.sourcePath);
       const res = buildSectionMarkdown(a.lines, a.raw, info.lineStart, info.lineEnd, a.regions, a.hasComments);
@@ -1794,7 +1821,9 @@ class ClaudeMarkdownViewer extends Plugin {
       // Liegt das Ziel in einem Klapp- oder Kommentarbereich, steckt die
       // Überschrift im ersten Abschnitt des Bereichs; ihr eigener Abschnitt ist
       // ausgeblendet. Dann im DOM suchen statt über die Zeile springen.
-      const lines = splitLines(text);
+      // prepareLines wie in analyze(), sonst fehlen maskierte \<details> aus
+      // Docs-Exporten.
+      const lines = prepareLines(splitLines(text));
       const region = this.findRegions(lines, computeProtectedMask(lines)).regions.find(
         (r) => r.start <= target.line && target.line <= r.end
       );
