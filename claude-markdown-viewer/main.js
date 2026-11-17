@@ -307,7 +307,9 @@ function acceptMath(inner, display, text, start, end) {
   }
   if (/\n[ \t>]*\n/.test(inner)) return false;
   if (DISPLAY_MATH_HINT.test(t)) return true;
-  return isLineStartAt(text, start) && isLineEndAt(text, end) && !PROSE_ONLY.test(t);
+  // Allein auf der Zeile: Formel, außer reiner Text oder eine reine Zahl wie
+  // „\[1\]“ (maskierte Klammern, etwa ein Quellenverweis).
+  return isLineStartAt(text, start) && isLineEndAt(text, end) && !PROSE_ONLY.test(t) && !/^\d+$/.test(t);
 }
 
 /**
@@ -546,6 +548,18 @@ function escapeComments(md, withFrontmatter = true) {
 }
 
 /**
+ * True, wenn die Datei Bereiche über mehrere Abschnitte hat (<details>,
+ * %%-Paare), auch maskierte aus Docs-Exporten.
+ * @param {string} text ganze Datei
+ */
+function fileHasRegions(text) {
+  if (!/<details|%%|\\</i.test(text)) return false;
+  const lines = prepareLines(splitLines(text));
+  const mask = computeProtectedMask(lines);
+  return findDetailsRegions(lines, mask).length > 0 || findCommentRegions(lines, mask).length > 0;
+}
+
+/**
  * Vereinigt sich überschneidende Zeilenbereiche (<details> und Kommentare).
  * @param {...Array<{ start: number, end: number }>} lists
  * @returns {Array<{ start: number, end: number }>}
@@ -578,22 +592,36 @@ const ESCAPED_TAG_RE =
   /\\<(\/?)(u|ins|sub|sup|mark|kbd|b|strong|i|em|s|del|small|details|summary)(?=[\s/>])([^<>]*)>/gi;
 const TAG_GAP_RE = /(<\/?(?:details|summary)\b[^<>]*>)&#10;(?=<\/?(?:details|summary)\b)/gi;
 const ESCAPED_ALERT_RE = /^((?:[ \t]{0,3}>[ \t]?)+)&#91;!([A-Za-z][\w-]*)\\?\]/;
+const SUMMARY_LINE_RE = /^[ \t>]*<\/?summary[\s>]/i;
 
 /**
  * @param {string} text Textstück ohne Inline-Code
+ * @param {boolean} withDetails auch <details> und <summary> entmaskieren
  */
-function unescapeHtmlSegment(text) {
-  return text.replace(ESCAPED_TAG_RE, '<$1$2$3>').replace(TAG_GAP_RE, '$1 ');
+function unescapeHtmlSegment(text, withDetails) {
+  return text
+    .replace(ESCAPED_TAG_RE, (m, slash, tag, attrs) =>
+      !withDetails && /^(?:details|summary)$/i.test(tag) ? m : `<${slash}${tag}${attrs}>`
+    )
+    .replace(TAG_GAP_RE, '$1 ');
 }
 
 /**
- * Stellt maskierte Formatierungen einer Zeile wieder her.
+ * Stellt maskierte Formatierungen einer Zeile wieder her. \<details> und
+ * \<summary> nur nach derselben Regel wie unmaskiertes <details>: <details>
+ * allein oder mit <summary> am Zeilenanfang, </details> am Zeilenanfang oder
+ * -ende, <summary> am Zeilenanfang. Mitten im Satz bleiben sie Text; sonst
+ * würde der Browser den Rest des Absatzes in einen zugeklappten Bereich
+ * stecken.
  * @param {string} line
  */
 function unescapeHtmlLine(line) {
   const out = line.replace(ESCAPED_ALERT_RE, '$1[!$2]');
   if (out.indexOf('\\<') === -1) return out;
-  return mapOutsideInlineCode(out, unescapeHtmlSegment);
+  const full = mapOutsideInlineCode(out, (part) => unescapeHtmlSegment(part, true));
+  const s = stripInlineCode(full);
+  if (DETAILS_OPEN_NESTED.test(s) || DETAILS_CLOSE_EDGE.test(s) || SUMMARY_LINE_RE.test(s)) return full;
+  return mapOutsideInlineCode(out, (part) => unescapeHtmlSegment(part, false));
 }
 
 /**
@@ -1456,21 +1484,54 @@ class ClaudeMarkdownViewer extends Plugin {
     }
   }
 
+  /**
+   * Markdown-Ansichten, die diese Datei zeigen.
+   * @param {string} path
+   * @param {boolean} previewOnly nur Ansichten in der Leseansicht
+   * @returns {import('obsidian').MarkdownView[]}
+   */
+  viewsOfFile(path, previewOnly) {
+    /** @type {import('obsidian').MarkdownView[]} */
+    const views = [];
+    for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView) || !view.file || view.file.path !== path) continue;
+      if (!previewOnly || view.getMode() === 'preview') views.push(view);
+    }
+    return views;
+  }
+
   /** @param {import('obsidian').TAbstractFile} file */
   onFileModified(file) {
-    if (!(file instanceof TFile) || !this.pathsWithRegions.has(file.path)) return;
+    if (!(file instanceof TFile) || this.viewsOfFile(file.path, false).length === 0) return;
     const old = this.rerenderTimers.get(file.path);
     if (old) window.clearTimeout(old);
     const timer = window.setTimeout(() => {
       this.rerenderTimers.delete(file.path);
-      for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
-        const view = leaf.view;
-        if (view instanceof MarkdownView && view.file && view.file.path === file.path && view.getMode() === 'preview') {
-          view.previewMode.rerender(true);
-        }
-      }
+      void this.rerenderAfterModify(file);
     }, 400);
     this.rerenderTimers.set(file.path, timer);
+  }
+
+  /**
+   * Obsidian stellt nach einer Änderung nur geänderte Abschnitte neu dar.
+   * Hat oder hatte die Datei Bereiche über mehrere Abschnitte (<details>,
+   * %%-Paare), passen die unveränderten Abschnitte dann nicht mehr dazu; die
+   * Datei wird ganz neu dargestellt. Das gilt auch, wenn erst die Änderung
+   * einen Bereich entstehen lässt (Datei wird dafür nur gelesen).
+   * @param {import('obsidian').TFile} file
+   */
+  async rerenderAfterModify(file) {
+    try {
+      if (this.viewsOfFile(file.path, true).length === 0) return;
+      if (!this.pathsWithRegions.has(file.path)) {
+        if (!fileHasRegions(await this.app.vault.cachedRead(file))) return;
+        this.pathsWithRegions.add(file.path);
+      }
+      for (const view of this.viewsOfFile(file.path, true)) view.previewMode.rerender(true);
+    } catch (err) {
+      console.error(LOG_PREFIX, 'Neu darstellen nach Dateiänderung fehlgeschlagen', err);
+    }
   }
 
   /**
@@ -1531,6 +1592,11 @@ class ClaudeMarkdownViewer extends Plugin {
    */
   async processSection(el, ctx) {
     if (el.classList.contains('cmv-rerendered')) return;
+    // Inhalt, den das Plugin selbst neu darstellt (Abschnitt oder Vorschau
+    // eines ```markdown-Blocks), ist schon umgebaut. Liefert getSectionInfo
+    // dort wider Erwarten die Daten der Datei, würde der Abschnitt sich sonst
+    // immer wieder selbst neu darstellen.
+    if (el.parentElement && el.parentElement.closest('.cmv-rerendered, .cmv-mdblock')) return;
     /** @type {import('obsidian').MarkdownSectionInformation | null} */
     let info = null;
     try {
@@ -1943,6 +2009,7 @@ class ViewerSettingTab extends PluginSettingTab {
   findDetailsRegions,
   findCommentRegions,
   escapeComments,
+  fileHasRegions,
   mergeRegions,
   unescapeHtmlLine,
   prepareLines,

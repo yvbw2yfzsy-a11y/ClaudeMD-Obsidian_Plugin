@@ -105,6 +105,13 @@ test('\\(…\\) und \\[…\\] werden immer Formel, maskierte Klammern nicht', ()
   assert.strictEqual(T.convertMathDelimiters('\\[1\\] und \\[\\[Wikilink\\]\\]'), '\\[1\\] und \\[\\[Wikilink\\]\\]');
 });
 
+test('\\[1\\] allein auf der Zeile bleibt Text, \\[1+1\\] wird Formel', () => {
+  assert.strictEqual(T.convertMathDelimiters('Quellen:\n\n\\[1\\]\n\nText'), 'Quellen:\n\n\\[1\\]\n\nText');
+  assert.strictEqual(T.convertMathDelimiters('\\[ 12 \\]'), '\\[ 12 \\]');
+  assert.strictEqual(T.convertMathDelimiters('\\[1+1\\]'), '$$1+1$$');
+  assert.strictEqual(T.convertMathDelimiters('\\[\n12\n\\]'), '\\[\n12\n\\]');
+});
+
 test('stripTexDelimiters: mehrere $$-Formeln bleiben getrennt', () => {
   const chunks = T.splitTexChunks(T.stripTexDelimiters('$$a$$\n\n$$b$$')).map((c) => T.stripTexDelimiters(c));
   assert.deepStrictEqual(chunks, ['a', 'b']);
@@ -125,6 +132,22 @@ test('\\<u>, \\<sub>, \\<sup> werden Formatierung, Code bleibt', () => {
   );
   assert.strictEqual(T.unescapeHtmlLine('Sternchen \\* und \\[\\[Wikilink\\]\\]'), 'Sternchen \\* und \\[\\[Wikilink\\]\\]');
   assert.strictEqual(T.unescapeHtmlLine('Zeile \\<br> bleibt'), 'Zeile \\<br> bleibt');
+});
+
+test('\\<details> und \\<summary> mitten im Satz bleiben Text, am Zeilenrand nicht', () => {
+  // Mitten im Satz: bleibt maskiert (sonst steckt der Browser den Rest in
+  // einen zugeklappten Bereich); andere Tags derselben Zeile werden dargestellt.
+  assert.strictEqual(T.unescapeHtmlLine('Das Tag \\<details> öffnet, \\<u>hier\\</u> weiter.'), 'Das Tag \\<details> öffnet, <u>hier</u> weiter.');
+  assert.strictEqual(T.unescapeHtmlLine('Mit \\<summary> setzt man den Titel.'), 'Mit \\<summary> setzt man den Titel.');
+  assert.strictEqual(T.unescapeHtmlLine('Man schließt mit \\</details> ab.'), 'Man schließt mit \\</details> ab.');
+  assert.strictEqual(T.unescapeHtmlLine('\\<details> ist ein HTML-Element.'), '\\<details> ist ein HTML-Element.');
+  // Wie ein Klappbereich auf der Zeile: dargestellt.
+  assert.strictEqual(T.unescapeHtmlLine('\\<details open>&#10;\\<summary>T\\</summary>'), '<details open> <summary>T</summary>');
+  assert.strictEqual(T.unescapeHtmlLine('   \\<details>'), '   <details>');
+  assert.strictEqual(T.unescapeHtmlLine('\\<summary>Titel\\</summary>'), '<summary>Titel</summary>');
+  assert.strictEqual(T.unescapeHtmlLine('\\</details>'), '</details>');
+  assert.strictEqual(T.unescapeHtmlLine('Letzte Zeile\\</details>'), 'Letzte Zeile</details>');
+  assert.strictEqual(T.unescapeHtmlLine('> \\<details>&#10;\\<summary>Z\\</summary>'), '> <details> <summary>Z</summary>');
 });
 
 test('Hinweisbox &#91;!NOTE\\] im Zitat wird [!NOTE]', () => {
@@ -158,6 +181,19 @@ test('Schnelltest je Datei: Merker liefert dasselbe wie der Test', () => {
   assert.strictEqual(p.fileNeedsWork('nur Text', 'd'), false);
 });
 
+test('processSection: Inhalt in schon neu dargestelltem Abschnitt wird nicht erneut umgebaut', async () => {
+  const text = '# T\n\nFormel \\(x\\)\n';
+  const nested = fakeSection(2, 2, text);
+  nested.el.parentElement = { closest: (sel) => (sel.includes('.cmv-rerendered') ? {} : null) };
+  await newPlugin().processSection(nested.el, nested.ctx);
+  assert.strictEqual(nested.el.rendered, null);
+  // Gegenprobe: normaler Abschnitt (Eltern nicht vom Plugin) wird umgebaut.
+  const top = fakeSection(2, 2, text);
+  top.el.parentElement = { closest: () => null };
+  await newPlugin().processSection(top.el, top.ctx);
+  assert.strictEqual(top.el.rendered, 'Formel $x$');
+});
+
 test('processSection: Abschnitt ohne Umbau bleibt, wie Obsidian ihn zeigt', async () => {
   const text = '# T\n\nNur Text mit \\(x\\) weiter unten.\n\nKein Umbau hier.\n';
   const sec = fakeSection(4, 4, text);
@@ -183,6 +219,43 @@ test('%%-Paar über Absätze: Text sichtbar, Folgeabschnitt ausgeblendet', async
   const later = fakeSection(4, 4, text);
   await plugin.processSection(later.el, later.ctx);
   assert.ok(later.el.classes.has('cmv-hidden'));
+});
+
+test('Dateiänderung: ganz neu darstellen, auch wenn erst die Änderung einen Bereich erzeugt', async () => {
+  /** @param {string} content @param {string} mode */
+  const setup = (content, mode) => {
+    const file = new TFile('a.md');
+    const view = Object.create(MarkdownView.prototype);
+    let reran = 0;
+    Object.assign(view, { file, getMode: () => mode, previewMode: { rerender: () => reran++ } });
+    const plugin = newPlugin({ workspace: { getLeavesOfType: () => [{ view }] }, vault: { cachedRead: async () => content }, metadataCache: {} });
+    return { plugin, file, count: () => reran };
+  };
+  const created = setup('Text\n\n<details>\n<summary>S</summary>\n\nInhalt\n\n</details>\n', 'preview');
+  await created.plugin.rerenderAfterModify(created.file);
+  assert.strictEqual(created.count(), 1);
+  assert.ok(created.plugin.pathsWithRegions.has('a.md'));
+  const pair = setup('50 %% und\n\n70 %% gesamt\n', 'preview');
+  await pair.plugin.rerenderAfterModify(pair.file);
+  assert.strictEqual(pair.count(), 1);
+  const plain = setup('Nur Text mit einem 50 %% und \\(x\\)\n', 'preview');
+  await plain.plugin.rerenderAfterModify(plain.file);
+  assert.strictEqual(plain.count(), 0);
+  // Bereich war vorher da, jetzt nicht mehr: trotzdem neu darstellen.
+  const removed = setup('Nur Text\n', 'preview');
+  removed.plugin.pathsWithRegions.add('a.md');
+  await removed.plugin.rerenderAfterModify(removed.file);
+  assert.strictEqual(removed.count(), 1);
+  // Bearbeitungsmodus: nichts zu tun.
+  const source = setup('<details>\n<summary>S</summary>\n\nX\n\n</details>\n', 'source');
+  await source.plugin.rerenderAfterModify(source.file);
+  assert.strictEqual(source.count(), 0);
+});
+
+test('fileHasRegions erkennt auch maskierte Docs-Klappbereiche', () => {
+  assert.strictEqual(T.fileHasRegions('\\<details>&#10;\\<summary>A\\</summary>\n\nX\n\n\\</details>\n'), true);
+  assert.strictEqual(T.fileHasRegions('Das Tag \\<details> im Satz.\n\nMehr \\</details> hier.\n'), false);
+  assert.strictEqual(T.fileHasRegions('```\n%%\n%%\n```\n'), false);
 });
 
 test('escapeComments ersetzt %% nur außerhalb von Code', () => {

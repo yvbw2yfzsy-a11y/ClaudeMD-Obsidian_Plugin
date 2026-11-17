@@ -23,7 +23,7 @@ Was Obsidian selbst kann (`$…$`, `$$…$$`, Tabellen, Mermaid, Hinweisboxen, F
 | Code-Block `svg` | Grafik |
 | `\(…\)` und `\[…\]` | Formel. Maskierte Klammern wie `\[1\]` oder `\[\[Wikilink\]\]` bleiben Text. |
 | `<details>` | Klappbereich mit vollem Markdown, auch mit Leerzeilen, verschachtelt und in Listen. Erkannt, wenn `<details>` allein oder mit `<summary>` auf der Zeile steht. |
-| Docs-Export: `\<u>`, `\<sub>`, `\<sup>`, `\<details>` usw. | die Formatierung (unterstrichen, H₂O, x², Klappbereich) statt der maskierten Tags |
+| Docs-Export: `\<u>`, `\<sub>`, `\<sup>`, `\<details>` usw. | die Formatierung (unterstrichen, H₂O, x², Klappbereich) statt der maskierten Tags. `\<details>` und `\<summary>` nur, wenn sie wie ein Klappbereich auf der Zeile stehen; mitten im Satz bleiben sie Text. |
 | Docs-Export: `> &#91;!NOTE\]` | Hinweisbox |
 | Docs-Export: `[embedded content: …]` | Hinweiskasten: Diagramm oder Chart fehlt im Export |
 | `%%…%%` | Text statt Obsidian-Kommentar (Claude kennt diese Syntax nicht) |
@@ -49,7 +49,7 @@ Zum ausnahmsweisen Bearbeiten in Obsidian die Einstellung ausschalten.
 - Charts und Diagramme aus Claude Docs fehlen schon im Markdown-Export. Das Plugin zeigt dort einen Hinweis.
 - Ganze LaTeX-Dokumente lassen sich ohne LaTeX-Programm nicht setzen.
 - Klappbereiche, `\(…\)` und maskierte Tags werden nur in der Leseansicht umgebaut, nicht in eingebetteten Notizen (`![[…]]`) und Hover-Vorschauen.
-- Ein Docs-Export maskiert Formatierungen und wörtlich getippte Tags gleich. Das Plugin stellt beide als Formatierung dar.
+- Ein Docs-Export maskiert Formatierungen und wörtlich getippte Tags gleich. Das Plugin stellt beide als Formatierung dar. Ausnahme: `\<details>` und `\<summary>` mitten im Satz bleiben Text.
 - Einfache Zeilenumbrüche regelt Obsidians Einstellung „Strenge Zeilenumbrüche“. Aus (Standard) zeigt Zeilen wie Claude untereinander.
 - Belegt ein anderes Plugin die Code-Blöcke `latex`, `math`, `csv`, `tsv`, `markdown`, `md` oder `svg`, meldet das Plugin das beim Start und lässt diese Blöcke aus.
 - Ein Link aus einer anderen Datei auf eine Überschrift in einem Klappbereich landet am Anfang des Bereichs.
@@ -58,6 +58,13 @@ Zum ausnahmsweisen Bearbeiten in Obsidian die Einstellung ausschalten.
 - Nicht zusammen mit „LaTeX Delimiter Renderer“ oder „Details Markdown“ verwenden: beide machen Teile davon und würden doppelt eingreifen.
 
 ## Änderungen
+
+**2.0.2**
+
+- Geändert: Maskiertes `\<details>` und `\<summary>` aus Docs-Exporten wird nur noch dargestellt, wenn es wie ein Klappbereich auf der Zeile steht (wie bei unmaskiertem `<details>`). Mitten im Satz bleibt es Text; vorher steckte der Browser den Rest des Absatzes in einen zugeklappten Bereich.
+- Geändert: `\[1\]` allein auf einer Zeile bleibt Text (vorher Formel). Gilt für reine Zahlen; `\[1+1\]` bleibt Formel.
+- Behoben: Fügt eine Dateiänderung erst einen Klappbereich oder ein `%%`-Paar um vorhandenen Text ein, wird die Datei jetzt ganz neu dargestellt. Vorher konnten Abschnitte doppelt erscheinen, bis die Datei neu geöffnet wurde.
+- Absicherung: Inhalt, den das Plugin selbst neu darstellt, wird nicht noch einmal umgebaut.
 
 **2.0.1**
 

@@ -2,11 +2,24 @@
 
 Geprüft wurden `main.js`, `styles.css`, `manifest.json` und `README.md` aus `claude-markdown-viewer-1.1.0.zip` sowie die drei Testdateien. Eine Anleitung, ein Prüfbericht oder die ursprüngliche Anfrage lagen nicht bei und sind deshalb nicht geprüft. Behauptungen in README und Code-Kommentaren wurden als Behauptungen behandelt.
 
+## Stand 2.0.2: übernommene Vorschläge
+
+Auf Wunsch übernommen (Bezeichnungen aus dem Chat-Bericht):
+
+- O1: `\<details>`, `\<summary>`, `\</details>` aus Docs-Exporten werden nur entmaskiert, wenn die Zeile dieselbe Regel erfüllt wie unmaskiertes `<details>` (`<details>` allein oder mit `<summary>` am Zeilenanfang, `</details>` am Zeilenanfang oder -ende, `<summary>` am Zeilenanfang). Übrige Tags wie bisher.
+- O2: `processSection` überspringt Abschnitte, deren Eltern in `.cmv-rerendered` oder `.cmv-mdblock` liegen. Wirkt nur, wenn Obsidian die Abschnitte beim Nachbearbeiten schon eingehängt hat; das ist nicht geprüft.
+- O6: `\[Zahl\]` allein auf einer Zeile bleibt Text (nur ganze Zahlen).
+- O7: Nach einer Dateiänderung wird eine geöffnete Datei auch dann ganz neu dargestellt, wenn erst die Änderung einen Bereich erzeugt (`vault.cachedRead`, nur Lesen).
+
+Nicht übernommen, auf Wunsch: O3 bis O5 und O8, O9.
+
+Geprüft: 34 Regressionstests bestehen (2.0.1: 29), die 5 neuen schlagen gegen 2.0.1 fehl. Typprüfung gegen 1.14.4 und 1.5.7 ohne Fehler. Zufallsvergleich gegen 2.0.1: Abweichungen nur in den gewollten Fällen (Zeilen mit maskiertem `\<details>`/`\<summary>` außerhalb der Klappbereich-Regel; `$$Zahl$$` allein auf der Zeile).
+
 ## Stand 2.0.1: Prüfung von 2.0.0
 
 Geprüft: `main.js`, `styles.css`, `manifest.json`, `README.md`, `tests/regression.js` vom Zweig mit 2.0.0. Die Testdateien („Claude Test 1/2“, `claude-test-linkziel.md`) lagen nicht vor.
 
-Ausgeführt: Regressionstests; Typprüfung `tsc --checkJs --strict` gegen `obsidian.d.ts` 1.14.4 (aktuell) und 1.5.7 (passend zu `minAppVersion` 1.5.0), beide 0 Fehler, auch mit `--noUnusedLocals`; Vergleich alter und neuer Funktionen auf 60 000 Zufallseingaben (300 000 Vergleiche, 0 Abweichungen); SVG-Bilder in Chromium (Playwright); Slugs gegen `github-slugger@2`; Laufzeit von `processSection` an einer 1-MB-Datei.
+Ausgeführt: Regressionstests; Typprüfung `tsc --checkJs --strict` gegen `obsidian.d.ts` 1.14.4 (aktuell) und 1.5.7 (passend zu `minAppVersion` 1.5.0), beide 0 Fehler, auch mit `--noUnusedLocals`; Vergleich alter und neuer Funktionen auf 60 000 Zufallseingaben (300 000 Vergleiche, 0 Abweichungen; der erste Lauf hatte einen fehlerhaften Zufallsgenerator mit sich wiederholenden Eingaben und wurde mit mulberry32 wiederholt, 987 von 1000 Eingaben verschieden); SVG-Bilder in Chromium (Playwright); Slugs gegen `github-slugger@2`; Laufzeit von `processSection` an einer 1-MB-Datei.
 
 Behoben (je mit Regressionstest, der gegen 2.0.0 fehlschlägt):
 
@@ -16,7 +29,7 @@ Behoben (je mit Regressionstest, der gegen 2.0.0 fehlschlägt):
 - Schnelltest je Abschnitt lief über die ganze Datei (quadratisch). Jetzt einmal je Datei: 1-MB-Datei ohne Umbau 4011 ms → 8 ms.
 - Doppelte Logik zusammengefasst (`mapOutsideCodeBlocks`, `mapOutsideInlineCode`), Verhalten per Zufallsvergleich gleich.
 
-Offen, mit Rückfrage an den Nutzer: maskiertes `\<details>` mitten im Satz versteckt den Rest des Absatzes; `\[1\]` allein auf einer Zeile wird Formel; eingerückte Code-Blöcke werden mit umgebaut; Dateiänderung, die erst einen Bereich entstehen lässt, stellt nicht alles neu dar; weitere Punkte im Chat-Bericht.
+Offen, mit Rückfrage an den Nutzer: maskiertes `\<details>` mitten im Satz versteckt den Rest des Absatzes; `\[1\]` allein auf einer Zeile wird Formel; eingerückte Code-Blöcke werden mit umgebaut; Dateiänderung, die erst einen Bereich entstehen lässt, stellt nicht alles neu dar; weitere Punkte im Chat-Bericht. Entscheidung siehe Stand 2.0.2.
 
 ## Stand 2.0.0: nur noch eine Darstellung
 

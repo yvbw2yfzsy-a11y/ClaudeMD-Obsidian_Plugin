@@ -1,7 +1,7 @@
 {
   "id": "claude-markdown-viewer",
   "name": "Claude Markdown Viewer",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "minAppVersion": "1.5.0",
   "description": "Zeigt Markdown aus Claude Docs, Claude-Chats und Claude Code immer fertig dargestellt: Formeln, CSV-Tabellen, Klappbereiche, Bilder. Nur Anzeige, keine Bearbeitung.",
   "author": "Claude",
