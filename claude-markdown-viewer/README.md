@@ -71,6 +71,12 @@ In der Befehlspalette (Cmd + P), Präfix „Claude Markdown Viewer“:
 
 ## Änderungen
 
+**1.1.1**
+
+- Behoben: Ein Klick auf einen Tag (`#tag`) sprang zu einer gleichnamigen Überschrift, statt die Tag-Suche zu öffnen.
+- Behoben: GitHub-Anker bei doppelten Überschriften, wenn eine andere Überschrift selbst auf „-1“ endet (z. B. „Beispiel“, „Beispiel“, „Beispiel 1“).
+- Behoben: Ein `math`- oder `latex`-Block mit mehreren `$$…$$`-Formeln, durch Leerzeilen getrennt, zeigte nur den Quelltext mit Fehlerhinweis.
+
 **1.1.0**
 
 - Neu: Darstellung „wie Claude“ oder „Norm“, als Standard und je Datei (Augen-Symbol, Befehle).

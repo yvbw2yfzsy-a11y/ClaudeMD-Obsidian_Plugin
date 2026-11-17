@@ -830,14 +830,21 @@ function headingPlainText(raw) {
  * @returns {HeadingIndex}
  */
 function makeHeadingIndex(list, anchors) {
+  // Doppelte Slugs wie github-slugger: Ist ein Slug schon vergeben (auch durch
+  // eine Überschrift, die selbst auf "-1" endet), wird weitergezählt.
   /** @type {Map<string, number>} */
-  const seen = new Map();
+  const occurrences = new Map();
   const headings = list.map((h) => {
     const text = headingPlainText(h.raw);
     const base = githubSlug(text);
-    const n = seen.get(base) || 0;
-    seen.set(base, n + 1);
-    return { text, raw: h.raw, line: h.line, level: h.level, slug: n === 0 ? base : `${base}-${n}` };
+    let slug = base;
+    while (occurrences.has(slug)) {
+      const n = (occurrences.get(base) || 0) + 1;
+      occurrences.set(base, n);
+      slug = `${base}-${n}`;
+    }
+    occurrences.set(slug, 0);
+    return { text, raw: h.raw, line: h.line, level: h.level, slug };
   });
   return { headings, anchors };
 }
@@ -988,7 +995,11 @@ function stripTexDelimiters(source) {
   /** @param {string} a @param {string} b */
   const strip = (a, b) => {
     if (s.length >= a.length + b.length && s.startsWith(a) && s.endsWith(b)) {
-      s = s.slice(a.length, s.length - b.length).trim();
+      const inner = s.slice(a.length, s.length - b.length);
+      // Mehrere Formeln wie "$$a$$ … $$b$$": nicht das äußere Paar entfernen,
+      // sonst bleibt "a$$ … $$b" stehen. Die Teile werden einzeln behandelt.
+      if (inner.includes(a) || inner.includes(b)) return false;
+      s = inner.trim();
       return true;
     }
     return false;
@@ -2107,7 +2118,9 @@ class ClaudeMarkdownViewer extends Plugin {
       return false;
     }
     const viewEl = pane.createDiv({ cls: 'cmv-math-view' });
-    for (const chunk of splitTexChunks(tex)) {
+    for (const part of splitTexChunks(tex)) {
+      // Jede Formel kann eigene Begrenzer haben ($$a$$, Leerzeile, $$b$$).
+      const chunk = stripTexDelimiters(part) || part;
       /** @type {HTMLElement | null} */
       let math = null;
       try {
@@ -2314,6 +2327,9 @@ class ClaudeMarkdownViewer extends Plugin {
     if (!target || typeof target.closest !== 'function') return;
     const a = target.closest('a');
     if (!a || !a.closest('.markdown-preview-view, .markdown-rendered')) return;
+    // Obsidian-Tags (<a class="tag" href="#tag">) sind keine Anker: Ein Klick
+    // soll die Tag-Suche öffnen, nicht zu einer gleichnamigen Überschrift springen.
+    if (a.classList.contains('tag')) return;
     const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
     if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;
     try {
