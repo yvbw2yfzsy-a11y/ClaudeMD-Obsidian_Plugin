@@ -1,6 +1,27 @@
-# Prüfbericht: Claude Markdown Viewer 1.1.0 bis 1.2.1
+# Prüfbericht: Claude Markdown Viewer 1.1.0 bis 2.0.0
 
 Geprüft wurden `main.js`, `styles.css`, `manifest.json` und `README.md` aus `claude-markdown-viewer-1.1.0.zip` sowie die drei Testdateien. Eine Anleitung, ein Prüfbericht oder die ursprüngliche Anfrage lagen nicht bei und sind deshalb nicht geprüft. Behauptungen in README und Code-Kommentaren wurden als Behauptungen behandelt.
+
+## Stand 2.0.0: nur noch eine Darstellung
+
+Auf Wunsch gibt es nur noch eine Darstellung, die immer alles fertig zeigt. Entfernt wurden die drei Darstellungen (wie Claude Docs, wie Claude-Chat, Norm), Augen-Symbol, Befehle, Block-Umschalter, Docs-Erkennung, eigene Zeilenumbruch-Logik (Obsidian-Einstellung „Strenge Zeilenumbrüche“ regelt das), `www.`-Verlinkung (Obsidian verlinkt selbst, in der Leseansicht am iPad gesehen), Tags und `==` als Text, alle Einstellungen außer „Nur ansehen“. `main.js` schrumpft von rund 3060 auf rund 1950 Zeilen.
+
+Neu dargestellt:
+
+- Maskierte Formatierungen aus Docs-Exporten: `\<u>`, `\<sub>`, `\<sup>`, `\<mark>`, `\<kbd>`, `\<b>`/`\<strong>`, `\<i>`/`\<em>`, `\<s>`/`\<del>`, `\<ins>`, `\<small>`, `\<details>`/`\<summary>`. `\<br>` bleibt Text (zu oft in Erklärungen gemeint). `&#10;` zwischen `<details>` und `<summary>` wird zu einem Leerzeichen; die Zeilenzahl bleibt gleich, damit die Abschnitte zu Obsidians Zählung passen.
+- `> &#91;!NOTE\]` als Hinweisbox.
+- `<img src>` mit relativem Pfad: Das Plugin sucht die Datei relativ zur Markdown-Datei, sonst über Obsidians Link-Auflösung.
+- Code-Block `svg` als Grafik, über eine data:-Adresse in `<img>`. Darin laufen keine Skripte.
+
+Bewusst nicht dargestellt:
+
+- Ganze LaTeX-Dokumente (`\documentclass` …): Obsidians Formel-Engine (MathJax) setzt nur Formeln. Es gibt keinen Weg ohne LaTeX-Programm; das Plugin zeigt den Quelltext mit Hinweis.
+- `\[\[Wikilink\]\]` aus Docs-Exporten: Daraus würde ein Link auf eine nicht vorhandene Notiz.
+- Code-Block `html`: Darstellung bräuchte einen abgeschotteten Rahmen ohne Skripte; meist ist er als Code gemeint.
+
+Abwägung: Der Docs-Export maskiert echte Formatierung und wörtlich getippte Tags gleich. Getippter Text „\<u>…\</u>“ erscheint deshalb jetzt unterstrichen statt als Text.
+
+Regressionstests: 25, alle bestanden. Typprüfung (strict) ohne Fehler. Simulation: In Test 2 erscheinen „unterstrichen“, H₂O, x², die NOTE-Hinweisbox und der Klappbereich „Ausklappbar“ dargestellt; Test 1 unverändert.
 
 ## Stand 1.2.1: Leseansicht am iPad ohne Plugin
 

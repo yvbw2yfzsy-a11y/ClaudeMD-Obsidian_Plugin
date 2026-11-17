@@ -1,85 +1,14 @@
 /* Claude Markdown Viewer – Styles. Alle Klassen beginnen mit "cmv-". */
 
-/* Abschnitte, deren Inhalt in einem einklappbaren Block davor steckt */
+/* Abschnitte, deren Inhalt in einem Bereich davor steckt (<details>, %%…%%) */
 .cmv-hidden {
   display: none !important;
-}
-
-.cmv-is-hidden {
-  display: none !important;
-}
-
-/* ---------- Werkzeugleiste an Formel- und CSV-Blöcken ---------- */
-.cmv-block {
-  position: relative;
-}
-
-.cmv-toolbar {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  z-index: 2;
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 120ms ease-in-out;
-}
-
-.cmv-block:hover > .cmv-toolbar,
-.cmv-toolbar:focus-within {
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .cmv-toolbar {
-    opacity: 1;
-  }
-}
-
-.cmv-toolbar-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: auto;
-  padding: 3px 6px;
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-s);
-  box-shadow: none;
-  cursor: pointer;
-}
-
-.cmv-toolbar-btn:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-.cmv-toolbar-btn svg {
-  width: 14px;
-  height: 14px;
 }
 
 .cmv-note {
   margin-bottom: 4px;
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
-}
-
-/* Blöcke mit zwei Ansichten (Formel/Code, Tabelle/Text): In der Code-Ansicht
-   bleibt der Umschalter halb sichtbar, damit man die andere Ansicht findet. */
-.cmv-switch[data-cmv-view="code"] > .cmv-toolbar,
-.cmv-switch[data-cmv-view="text"] > .cmv-toolbar {
-  opacity: 0.6;
-}
-
-.cmv-switch:hover > .cmv-toolbar {
-  opacity: 1;
-}
-
-.cmv-pane > .cmv-note {
-  padding-top: 0.5em;
 }
 
 /* ---------- Formeln aus ```latex / ```math ---------- */
@@ -114,67 +43,17 @@
   margin: 0.5em 0;
 }
 
-/* ---------- ```markdown als gerendertes Beispiel ---------- */
+/* ---------- ```markdown als dargestelltes Beispiel ---------- */
 .cmv-mdblock {
   margin: 1em 0;
-  overflow: hidden;
+  padding: 0.25em 1em;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
 }
 
-.cmv-mdblock-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  font-size: var(--font-ui-smaller);
-  background: var(--background-secondary);
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.cmv-mdblock-label {
-  margin-right: auto;
-  font-weight: var(--font-semibold);
-  color: var(--text-muted);
-}
-
-.cmv-tabs {
-  display: inline-flex;
-  gap: 2px;
-}
-
-.cmv-tab {
-  height: auto;
-  padding: 2px 8px;
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-s);
-  box-shadow: none;
-  cursor: pointer;
-}
-
-.cmv-tab:hover {
-  color: var(--text-normal);
-}
-
-.cmv-tab.is-active {
-  color: var(--text-normal);
-  background: var(--background-primary);
-  border-color: var(--background-modifier-border);
-}
-
-.cmv-mdblock-body {
-  padding: 0 1em;
-}
-
-.cmv-mdblock-preview {
-  padding: 0.25em 0;
-}
-
-.cmv-mdblock-source pre {
-  margin: 0.75em 0;
+/* ---------- ```svg als Bild ---------- */
+.cmv-svg img {
+  max-width: 100%;
 }
 
 /* ---------- <details> als einklappbarer Abschnitt (Callout ohne Kasten) ---------- */
@@ -218,18 +97,32 @@
 }
 
 /* ---------- GitHub-Hinweisboxen: Farben wie auf GitHub ---------- */
-body.cmv-gh-alerts .callout[data-callout="important"] {
+.callout[data-callout="important"] {
   --callout-color: var(--callout-example);
 }
 
-body.cmv-gh-alerts .callout[data-callout="caution"] {
+.callout[data-callout="caution"] {
   --callout-color: var(--callout-error);
 }
 
-/* ---------- Checkboxen nur anzeigen ---------- */
-body.cmv-readonly-tasks .markdown-preview-view input.task-list-item-checkbox,
-body.cmv-readonly-tasks .markdown-rendered input.task-list-item-checkbox {
+/* ---------- Nur ansehen: Checkboxen ---------- */
+body.cmv-view-only .markdown-preview-view input.task-list-item-checkbox,
+body.cmv-view-only .markdown-rendered input.task-list-item-checkbox {
   pointer-events: none;
+}
+
+/* ---------- Nur ansehen: Eigenschaften (Frontmatter) ---------- */
+/* Sichtbar, aber nicht anklickbar. Links und die Überschrift „Eigenschaften“
+   (Ein- und Ausklappen) bleiben bedienbar. Tastatur fängt main.js ab. */
+body.cmv-view-only .markdown-preview-view .metadata-container,
+body.cmv-view-only .workspace-leaf-content[data-type="file-properties"] .metadata-container {
+  pointer-events: none;
+}
+
+body.cmv-view-only .markdown-preview-view .metadata-container a,
+body.cmv-view-only .markdown-preview-view .metadata-container .metadata-properties-heading,
+body.cmv-view-only .workspace-leaf-content[data-type="file-properties"] .metadata-container a {
+  pointer-events: auto;
 }
 
 /* ---------- Platzhalter für Diagramme aus Claude Docs ---------- */
@@ -272,18 +165,4 @@ body.cmv-readonly-tasks .markdown-rendered input.task-list-item-checkbox {
 .cmv-fnref {
   color: var(--link-color);
   cursor: pointer;
-}
-
-/* ---------- Eigenschaften (Frontmatter) nur anzeigen ---------- */
-/* Sichtbar, aber nicht anklickbar. Links und die Überschrift „Eigenschaften“
-   (Ein- und Ausklappen) bleiben bedienbar. Tastatur fängt main.js ab. */
-body.cmv-readonly-properties .markdown-preview-view .metadata-container,
-body.cmv-readonly-properties .workspace-leaf-content[data-type="file-properties"] .metadata-container {
-  pointer-events: none;
-}
-
-body.cmv-readonly-properties .markdown-preview-view .metadata-container a,
-body.cmv-readonly-properties .markdown-preview-view .metadata-container .metadata-properties-heading,
-body.cmv-readonly-properties .workspace-leaf-content[data-type="file-properties"] .metadata-container a {
-  pointer-events: auto;
 }
