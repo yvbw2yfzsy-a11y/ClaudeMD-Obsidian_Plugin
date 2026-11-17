@@ -273,3 +273,17 @@ body.cmv-readonly-tasks .markdown-rendered input.task-list-item-checkbox {
   color: var(--link-color);
   cursor: help;
 }
+
+/* ---------- Eigenschaften (Frontmatter) nur anzeigen ---------- */
+/* Sichtbar, aber nicht anklickbar. Links und die Überschrift „Eigenschaften“
+   (Ein- und Ausklappen) bleiben bedienbar. Tastatur fängt main.js ab. */
+body.cmv-readonly-properties .markdown-preview-view .metadata-container,
+body.cmv-readonly-properties .workspace-leaf-content[data-type="file-properties"] .metadata-container {
+  pointer-events: none;
+}
+
+body.cmv-readonly-properties .markdown-preview-view .metadata-container a,
+body.cmv-readonly-properties .markdown-preview-view .metadata-container .metadata-properties-heading,
+body.cmv-readonly-properties .workspace-leaf-content[data-type="file-properties"] .metadata-container a {
+  pointer-events: auto;
+}

@@ -31,6 +31,7 @@ const {
   renderMath,
   finishRenderMath,
   loadPrism,
+  debounce,
 } = obsidian;
 
 /* ======================================================================
@@ -72,6 +73,7 @@ const {
  * @property {boolean} scrollableTables
  * @property {boolean} githubAlertColors
  * @property {boolean} linkifyWww
+ * @property {boolean} obsidianSyntaxAsText
  */
 
 /** @type {ViewerSettings} */
@@ -89,7 +91,12 @@ const DEFAULT_SETTINGS = {
   scrollableTables: true,
   githubAlertColors: true,
   linkifyWww: true,
+  obsidianSyntaxAsText: true,
 };
+
+/** Eigenschaften (Frontmatter) in der Leseansicht und in der Seitenleiste. */
+const PROPERTIES_SELECTOR =
+  '.markdown-preview-view .metadata-container, .workspace-leaf-content[data-type="file-properties"] .metadata-container';
 
 const LOG_PREFIX = '[Claude Markdown Viewer]';
 const DETAILS_CALLOUT = 'claude-details';
@@ -380,18 +387,25 @@ function convertMathDelimiters(md, withFrontmatter = true) {
 
 /* ---------- <details>/<summary> ---------- */
 
-const DETAILS_OPEN_LINE = /^[ \t]{0,3}<details(?:\s[^>]*)?>/i;
+// Ein <details>-Block beginnt nur, wenn das Tag allein oder mit <summary> auf
+// der Zeile steht. Fließtext wie „<details> ist ein HTML-Element …“ bleibt so,
+// wie er ist.
+const DETAILS_OPEN_LINE = /^[ \t]{0,3}<details(?:\s[^>]*)?>[ \t]*(?:<summary[\s>]|$)/i;
+const DETAILS_OPEN_NESTED = /^[ \t>]*<details(?:\s[^>]*)?>[ \t]*(?:<summary[\s>]|$)/i;
 const DETAILS_OPEN_ANY = /<details(?:\s[^>]*)?>/gi;
 const DETAILS_CLOSE_ANY = /<\/details\s*>/gi;
+const DETAILS_CLOSE_EDGE = /^[ \t>]*<\/details\s*>|<\/details\s*>[ \t]*$/i;
 
 /**
+ * Zählt <details>-Tags einer Zeile. Gezählt werden nur Tags am Zeilenanfang
+ * bzw. -ende, nicht Erwähnungen mitten im Satz.
  * @param {string} line
  */
 function countDetailsTags(line) {
   const s = stripInlineCode(line).replace(/\\</g, '');
   return {
-    opens: (s.match(DETAILS_OPEN_ANY) || []).length,
-    closes: (s.match(DETAILS_CLOSE_ANY) || []).length,
+    opens: DETAILS_OPEN_NESTED.test(s) ? (s.match(DETAILS_OPEN_ANY) || []).length : 0,
+    closes: DETAILS_CLOSE_EDGE.test(s) ? (s.match(DETAILS_CLOSE_ANY) || []).length : 0,
   };
 }
 
@@ -434,9 +448,23 @@ function findDetailsRegions(lines, mask) {
  * Wandelt einen <details>-Block in einen einklappbaren Callout um. Obsidian
  * rendert Markdown in Callouts vollständig, auch verschachtelt.
  * @param {string} block
+ * @returns {string}
  */
 function detailsBlockToCallout(block) {
-  const m = /^[ \t]{0,3}<details(\s[^>]*)?>/i.exec(block);
+  // Eingerückt (z. B. in einem Listenpunkt): Einrückung abziehen, Callout
+  // bauen und wieder einrücken, damit er im Listenpunkt bleibt.
+  const indent = (/^[ \t]*/.exec(block) || [''])[0];
+  if (indent) {
+    const inner = block
+      .split('\n')
+      .map((l) => (l.startsWith(indent) ? l.slice(indent.length) : l.replace(/^[ \t]+/, '')))
+      .join('\n');
+    return detailsBlockToCallout(inner)
+      .split('\n')
+      .map((l) => (l === '' ? '' : indent + l))
+      .join('\n');
+  }
+  const m = /^<details(\s[^>]*)?>/i.exec(block);
   if (!m) return block;
   const isOpen = /(^|\s)open(\s|=|$)/i.test(m[1] || '');
   const rest = block.slice(m[0].length);
@@ -490,6 +518,102 @@ function convertDetailsInText(md, withFrontmatter = true) {
   }
   while (i < lines.length) out.push(lines[i++]);
   return out.join('\n');
+}
+
+/* ---------- Obsidian-Kommentare %%…%% ---------- */
+
+/**
+ * Zeilenbereiche, die Obsidian als Kommentar %%…%% behandelt. Claude kennt
+ * diese Syntax nicht. Ein einzelnes %% (etwa „Prozent 50 %%“) macht in
+ * Obsidian den ganzen Rest der Datei zum Kommentar. %% in Code zählt nicht.
+ * @param {string[]} lines
+ * @param {boolean[]} mask
+ * @returns {Array<{ start: number, end: number }>}
+ */
+function findCommentRegions(lines, mask) {
+  /** @type {Array<{ start: number, end: number }>} */
+  const regions = [];
+  let open = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i] || lines[i].indexOf('%%') === -1) continue;
+    const n = (stripInlineCode(lines[i]).match(/%%/g) || []).length;
+    for (let k = 0; k < n; k++) {
+      if (open === -1) {
+        open = i;
+      } else {
+        regions.push({ start: open, end: i });
+        open = -1;
+      }
+    }
+  }
+  if (open !== -1) regions.push({ start: open, end: lines.length - 1 });
+  return regions;
+}
+
+/**
+ * Ersetzt %% außerhalb von Code durch &#37;&#37;. Obsidian zeigt dann „%%“
+ * als Text statt einen Kommentar zu beginnen.
+ * @param {string} text Textstück ohne Code-Blöcke
+ */
+function escapeCommentChunk(text) {
+  const code = findInlineCodeRanges(text);
+  let out = '';
+  let last = 0;
+  for (const [a, b] of code) {
+    out += text.slice(last, a).replace(/%%/g, '&#37;&#37;') + text.slice(a, b);
+    last = b;
+  }
+  return out + text.slice(last).replace(/%%/g, '&#37;&#37;');
+}
+
+/**
+ * @param {string} md
+ * @param {boolean} [withFrontmatter] false für Ausschnitte mitten aus einer Datei
+ */
+function escapeComments(md, withFrontmatter = true) {
+  if (md.indexOf('%%') === -1) return md;
+  const lines = md.split('\n');
+  const mask = computeProtectedMask(lines, withFrontmatter);
+  /** @type {string[]} */
+  const out = [];
+  /** @type {string[]} */
+  let buf = [];
+  const flush = () => {
+    if (buf.length) {
+      out.push(escapeCommentChunk(buf.join('\n')));
+      buf = [];
+    }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) {
+      flush();
+      out.push(lines[i]);
+    } else {
+      buf.push(lines[i]);
+    }
+  }
+  flush();
+  return out.join('\n');
+}
+
+/**
+ * Vereinigt sich überschneidende Zeilenbereiche (<details> und Kommentare).
+ * @param {...Array<{ start: number, end: number }>} lists
+ * @returns {Array<{ start: number, end: number }>}
+ */
+function mergeRegions(...lists) {
+  const all = lists
+    .flat()
+    .map((r) => ({ start: r.start, end: r.end }))
+    .sort((a, b) => a.start - b.start);
+  /** @type {Array<{ start: number, end: number }>} */
+  const out = [];
+  for (const r of all) {
+    const last = out[out.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else out.push(r);
+  }
+  return out;
 }
 
 /* ---------- Einfache Zeilenumbrüche: getrennt oder zusammen ---------- */
@@ -643,8 +767,37 @@ function softBreakKind(lines, prot, i) {
     if (ATX_RE.test(c) || HR_RE.test(c) || DEFINITION_RE.test(c) || FENCE_RE.test(c) || startsInterruptingHtml(c)) return null;
     if (/^[ \t]*\|/.test(c)) return null;
   }
-  if (LIST_ITEM_RE.test(b.content) || SETEXT_UNDERLINE_RE.test(b.content) || SETEXT_UNDERLINE_RE.test(a.content)) return null;
+  if (LIST_ITEM_RE.test(b.content) && listItemBreaksParagraph(lines, i, b.content)) return null;
+  if (SETEXT_UNDERLINE_RE.test(b.content) || SETEXT_UNDERLINE_RE.test(a.content)) return null;
   return BR_END_RE.test(a.content.replace(/[ \t]+$/, '')) ? 'br' : 'soft';
+}
+
+const ORDERED_ITEM_RE = /^[ \t]*(\d{1,9})[.)](?:[ \t]+|$)/;
+
+/**
+ * Beendet Zeile i+1 (ein Listenpunkt) den Absatz in Zeile i? Nach CommonMark
+ * unterbricht eine nummerierte Liste einen Absatz nur, wenn sie mit 1
+ * beginnt; „Seit⏎2024. Jahr“ ist ein Absatz. Gehört der Absatz selbst zu
+ * einer Liste, ist „2.“ dagegen der nächste Punkt.
+ * @param {string[]} lines
+ * @param {number} i
+ * @param {string} nextContent Inhalt von Zeile i+1 ohne Zitat-Präfix
+ */
+function listItemBreaksParagraph(lines, i, nextContent) {
+  const m = ORDERED_ITEM_RE.exec(nextContent);
+  if (!m || Number(m[1]) === 1) return true;
+  for (let j = i; j >= 0; j--) {
+    const c = splitQuote(lines[j]).content;
+    if (c.trim() === '' || ATX_RE.test(c) || HR_RE.test(c) || FENCE_RE.test(c)) return false;
+    const first = j === 0 || splitQuote(lines[j - 1]).content.trim() === '';
+    // „2024. Jahr“ mitten im Absatz ist Fortsetzungstext (oder ein späterer
+    // Listenpunkt): weiter zurückgehen, bis der Absatz- oder Listenanfang klar ist.
+    const om = ORDERED_ITEM_RE.exec(c);
+    if (om && Number(om[1]) !== 1 && !first) continue;
+    if (LIST_ITEM_RE.test(c) || /^[ \t]/.test(c)) return true;
+    if (first) return false;
+  }
+  return false;
 }
 
 /**
@@ -688,12 +841,13 @@ function convertSoftBreaks(md, mode, withFrontmatter = true) {
 /**
  * Wandelt alles um (für Vorschauen und verschachtelte Darstellungen).
  * @param {string} md
- * @param {{ details: boolean, delims: boolean, breaks?: BreakMode | null }} opts
+ * @param {{ details: boolean, delims: boolean, comments?: boolean, breaks?: BreakMode | null }} opts
  */
 function transformMarkdown(md, opts) {
   let out = md;
   if (opts.details) out = convertDetailsInText(out);
   if (opts.delims) out = convertMathDelimiters(out);
+  if (opts.comments) out = escapeComments(out);
   if (opts.breaks) out = convertSoftBreaks(out, opts.breaks, true);
   return out;
 }
@@ -703,11 +857,12 @@ function transformMarkdown(md, opts) {
  * Obsidian rendert jeden durch Leerzeilen getrennten Block einzeln; ein
  * <details>-Block mit Leerzeilen zerfällt dabei in mehrere Abschnitte. Der
  * erste Abschnitt zeigt deshalb den ganzen Block, die übrigen bleiben leer.
+ * Dasselbe gilt für Bereiche, die Obsidian als Kommentar %%…%% ausblendet.
  * @param {string[]} lines Zeilen der ganzen Datei
  * @param {number} lineStart
  * @param {number} lineEnd
- * @param {Array<{ start: number, end: number }>} regions
- * @param {{ details: boolean, delims: boolean, breaks?: BreakMode | null }} opts
+ * @param {Array<{ start: number, end: number }>} regions <details>- und Kommentarbereiche
+ * @param {{ details: boolean, delims: boolean, comments?: boolean, breaks?: BreakMode | null }} opts
  * @returns {{ changed: boolean, markdown: string }}
  */
 function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
@@ -718,7 +873,7 @@ function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
   const last = Math.min(lineEnd, lines.length - 1);
   while (i <= last) {
     const line = i;
-    const r = opts.details ? regions.find((x) => x.start <= line && line <= x.end) : undefined;
+    const r = regions.length ? regions.find((x) => x.start <= line && line <= x.end) : undefined;
     if (r && r.start < lineStart) {
       changed = true;
       i = r.end + 1;
@@ -726,9 +881,16 @@ function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
     }
     if (r && r.start === i) {
       changed = true;
-      if (parts.length && parts[parts.length - 1].trim() !== '') parts.push('');
-      parts.push(detailsBlockToCallout(lines.slice(r.start, r.end + 1).join('\n')));
-      parts.push('');
+      const block = lines.slice(r.start, r.end + 1).join('\n');
+      if (opts.details && DETAILS_OPEN_LINE.test(lines[r.start])) {
+        // <details> ist ein eigener Block: Leerzeilen davor und danach.
+        if (parts.length && parts[parts.length - 1].trim() !== '') parts.push('');
+        parts.push(convertDetailsInText(block, false));
+        parts.push('');
+      } else {
+        // Kommentarbereich: kann mitten im Absatz beginnen, keine Leerzeilen einfügen.
+        parts.push(opts.details ? convertDetailsInText(block, false) : block);
+      }
       i = r.end + 1;
       continue;
     }
@@ -738,6 +900,13 @@ function buildSectionMarkdown(lines, lineStart, lineEnd, regions, opts) {
   let markdown = parts.join('\n');
   if (opts.delims) {
     const converted = convertMathDelimiters(markdown, lineStart === 0);
+    if (converted !== markdown) {
+      changed = true;
+      markdown = converted;
+    }
+  }
+  if (opts.comments) {
+    const converted = escapeComments(markdown, lineStart === 0);
     if (converted !== markdown) {
       changed = true;
       markdown = converted;
@@ -770,7 +939,18 @@ function collectFootnotes(lines, mask) {
     if (mask[i]) continue;
     const d = defRe.exec(lines[i]);
     if (d) {
-      defs.set(d[1], d[2].trim());
+      // Mehrzeilige Fußnote: eingerückte Folgezeilen gehören dazu, auch nach
+      // einer Leerzeile (weiterer Absatz der Fußnote).
+      const parts = [d[2].trim()];
+      for (let j = i + 1; j < lines.length && !mask[j]; j++) {
+        if (/^(?: {2,}|\t)\S/.test(lines[j])) {
+          parts.push(lines[j].trim());
+          continue;
+        }
+        if (lines[j].trim() === '' && j + 1 < lines.length && /^(?: {4}|\t)\S/.test(lines[j + 1])) continue;
+        break;
+      }
+      defs.set(d[1], parts.filter(Boolean).join(' '));
       continue;
     }
     const refRe = /\[\^([^\]\s]+)\](?!:)/g;
@@ -793,7 +973,9 @@ function collectFootnotes(lines, mask) {
 function githubSlug(text) {
   return text
     .toLowerCase()
-    .replace(/[^\p{L}\p{M}\p{N}\p{Pc}\- ]/gu, '')
+    // Wie github-slugger: Dezimal- und Buchstabenziffern bleiben, hochgestellte
+    // Ziffern, Brüche und eingekreiste Zahlen (²  ½  ①) fallen weg.
+    .replace(/[^\p{L}\p{M}\p{Nd}\p{Nl}\p{Pc}\- ]/gu, '')
     .replace(/ /g, '-');
 }
 
@@ -955,13 +1137,28 @@ function parseFolderList(folders) {
 }
 
 /**
+ * Liegt der Pfad in einem der Ordner? Groß- und Kleinschreibung zählen nicht
+ * (macOS und iPadOS unterscheiden sie im Dateisystem auch nicht).
+ * @param {string} path
+ * @param {string[]} folders
+ */
+function inDocsFolder(path, folders) {
+  if (!path) return false;
+  const p = path.toLowerCase();
+  return folders.some((f) => {
+    const fl = f.toLowerCase();
+    return p === fl || p.startsWith(fl + '/');
+  });
+}
+
+/**
  * Erkennt einen Markdown-Export aus Claude Docs.
  * @param {string} text
  * @param {string} path
  * @param {string[]} folders
  */
 function isDocsExport(text, path, folders) {
-  if (path && folders.some((f) => path === f || path.startsWith(f + '/'))) return true;
+  if (inDocsFolder(path, folders)) return true;
   if (text.includes('&#91;embedded content')) return true;
   const head = splitLines(text).slice(0, 15).map((l) => l.trim());
   const h1 = head.findIndex((l) => /^# \S/.test(l));
@@ -1181,7 +1378,7 @@ function decorateEmbedPlaceholders(root) {
     }
     const note = body.appendChild(doc.createElement('div'));
     note.className = 'cmv-embed-note';
-    note.textContent = 'Fehlt im Markdown-Export. Im Original-Doc ansehen oder Claude bitten, das Doc mit Diagrammen als Bilder zu exportieren.';
+    note.textContent = 'Fehlt im Markdown-Export. Nur im Original-Doc in Claude Docs zu sehen.';
     p.replaceWith(box);
   }
 }
@@ -1246,6 +1443,32 @@ function linkifyWww(root) {
     if (!any) continue;
     frag.append(text.slice(last));
     node.replaceWith(frag);
+  }
+}
+
+/**
+ * Obsidian macht aus „#wort“ einen Tag. Claude kennt keine Tags und zeigt den
+ * Text, wie er dasteht (etwa #include oder eine Farbe wie #ff0000).
+ * @param {HTMLElement} root
+ */
+function plainTags(root) {
+  const tags = root.matches('a.tag') ? [root] : Array.from(root.querySelectorAll('a.tag'));
+  for (const a of tags) {
+    if (a.closest('code, pre')) continue;
+    a.replaceWith(a.ownerDocument.createTextNode(a.textContent || ''));
+  }
+}
+
+/**
+ * Obsidian macht aus „==wort==“ eine Markierung. Im Claude-Chat und nach der
+ * Norm steht dort „==wort==“; aus „a==b und c==d“ würde sonst „b und c“
+ * markiert und die Gleichheitszeichen fehlten.
+ * @param {HTMLElement} root
+ */
+function unwrapMarks(root) {
+  for (const mark of Array.from(root.querySelectorAll('mark'))) {
+    if (mark.closest('code, pre')) continue;
+    mark.replaceWith('==', ...Array.from(mark.childNodes), '==');
   }
 }
 
@@ -1503,14 +1726,19 @@ class ClaudeMarkdownViewer extends Plugin {
   settings = Object.assign({}, DEFAULT_SETTINGS, { fileModes: {} });
 
   /** Analyse der ganzen Datei je Darstellung (docId). */
-  /** @type {Map<string, { text: string, lines: string[], regions: Array<{ start: number, end: number }>, isDocs: boolean, footnotes: { defs: Map<string, string>, order: Map<string, number> } }>} */
+  /** @type {Map<string, { text: string, lines: string[], regions: Array<{ start: number, end: number }>, hasDetails: boolean, hasComments: boolean, isDocs: boolean, footnotes: { defs: Map<string, string>, order: Map<string, number> } }>} */
   analysisByDoc = new Map();
 
-  /** Claude-Docs-Erkennung je Dateipfad. */
-  /** @type {Map<string, boolean>} */
+  /**
+   * Claude-Docs-Erkennung je Dateipfad. len: Länge des Texts, aus dem sie
+   * stammt. Verschachtelte Darstellungen (Klappbereich, Markdown-Vorschau)
+   * sehen nur einen Ausschnitt; der längste Text, also die ganze Datei, gilt.
+   * mark: ob die Datei ein wörtliches <mark>-Tag enthält.
+   */
+  /** @type {Map<string, { flag: boolean, len: number, mark: boolean }>} */
   docsFlagByPath = new Map();
 
-  /** Pfade, deren Darstellung Mehrabschnitts-Blöcke (<details>) enthält. */
+  /** Pfade, deren Darstellung Mehrabschnitts-Blöcke (<details>, %%) enthält. */
   /** @type {Set<string>} */
   pathsWithRegions = new Set();
 
@@ -1532,18 +1760,32 @@ class ClaudeMarkdownViewer extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new ViewerSettingTab(this.app, this));
 
-    for (const lang of ['latex', 'math']) {
-      this.registerMarkdownCodeBlockProcessor(lang, (source, el, ctx) => this.renderTexBlock(source, el, ctx, lang));
-    }
-    for (const lang of ['csv', 'tsv']) {
-      this.registerMarkdownCodeBlockProcessor(lang, (source, el, ctx) => this.renderCsvBlock(source, el, ctx, lang));
-    }
-    for (const lang of ['markdown', 'md']) {
-      this.registerMarkdownCodeBlockProcessor(lang, (source, el, ctx) => this.renderMarkdownBlock(source, el, ctx));
+    // Ist eine Sprache schon von einem anderen Plugin belegt, wirft Obsidian
+    // einen Fehler. Ohne Abfangen bräche onload hier ab, und das ganze Plugin
+    // (auch die Leseansicht-Sperre) liefe nicht.
+    /** @type {string[]} */
+    const busy = [];
+    /**
+     * @param {string} lang
+     * @param {(source: string, el: HTMLElement, ctx: import('obsidian').MarkdownPostProcessorContext) => Promise<void>} handler
+     */
+    const codeBlock = (lang, handler) => {
+      try {
+        this.registerMarkdownCodeBlockProcessor(lang, handler);
+      } catch (err) {
+        console.error(LOG_PREFIX, `Code-Block „${lang}“ ist schon von einem anderen Plugin belegt`, err);
+        busy.push(lang);
+      }
+    };
+    for (const lang of ['latex', 'math']) codeBlock(lang, (source, el, ctx) => this.renderTexBlock(source, el, ctx, lang));
+    for (const lang of ['csv', 'tsv']) codeBlock(lang, (source, el, ctx) => this.renderCsvBlock(source, el, ctx, lang));
+    for (const lang of ['markdown', 'md']) codeBlock(lang, (source, el, ctx) => this.renderMarkdownBlock(source, el, ctx));
+    if (busy.length) {
+      new Notice(`Claude Markdown Viewer: Code-Blöcke „${busy.join('“, „')}“ sind von einem anderen Plugin belegt und werden nicht umgebaut.`);
     }
 
     this.registerMarkdownPostProcessor((el, ctx) => this.processSection(el, ctx), 100);
-    this.registerMarkdownPostProcessor((el) => this.processDom(el), 200);
+    this.registerMarkdownPostProcessor((el, ctx) => this.processDom(el, ctx), 200);
 
     this.attachToDocument(document);
     this.registerEvent(
@@ -1592,7 +1834,7 @@ class ClaudeMarkdownViewer extends Plugin {
 
   onunload() {
     for (const doc of this.knownDocuments()) {
-      doc.body.classList.remove('cmv-readonly-tasks', 'cmv-gh-alerts');
+      doc.body.classList.remove('cmv-readonly-tasks', 'cmv-gh-alerts', 'cmv-readonly-properties');
       doc.querySelectorAll('.cmv-view-action').forEach((node) => node.remove());
     }
     for (const t of this.rerenderTimers.values()) window.clearTimeout(t);
@@ -1638,8 +1880,16 @@ class ClaudeMarkdownViewer extends Plugin {
   attachToDocument(doc) {
     if (this.attachedDocuments.has(doc)) return;
     this.attachedDocuments.add(doc);
+    // Sperren zuerst: Sie laufen vor dem Link-Handler und beenden das Ereignis.
+    this.registerDomEvent(doc, 'click', (evt) => this.onGuardClick(evt), { capture: true });
     this.registerDomEvent(doc, 'click', (evt) => this.onLinkClick(evt), { capture: true });
     this.registerDomEvent(doc, 'auxclick', (evt) => this.onLinkClick(evt), { capture: true });
+    this.registerDomEvent(doc, 'contextmenu', (evt) => this.onContextMenu(evt), { capture: true });
+    this.registerDomEvent(doc, 'focusin', (evt) => this.onGuardFocus(evt), { capture: true });
+    this.registerDomEvent(doc, 'beforeinput', (evt) => this.onGuardInput(evt), { capture: true });
+    this.registerDomEvent(doc, 'paste', (evt) => this.onGuardInput(evt), { capture: true });
+    this.registerDomEvent(doc, 'cut', (evt) => this.onGuardInput(evt), { capture: true });
+    this.registerDomEvent(doc, 'drop', (evt) => this.onGuardInput(evt), { capture: true });
     this.applyBodyClasses(doc);
   }
 
@@ -1649,7 +1899,76 @@ class ClaudeMarkdownViewer extends Plugin {
     for (const doc of docs) {
       doc.body.classList.toggle('cmv-readonly-tasks', this.settings.readOnlyCheckboxes);
       doc.body.classList.toggle('cmv-gh-alerts', this.settings.githubAlertColors);
+      doc.body.classList.toggle('cmv-readonly-properties', this.settings.lockReadingView);
     }
+  }
+
+  /* ---------- Nur ansehen: Checkboxen und Eigenschaften ---------- */
+
+  /**
+   * Checkboxen: CSS sperrt nur die Maus. Mit Tab und Leertaste entsteht
+   * dasselbe Klick-Ereignis, und Obsidian würde die Datei ändern. Abfangen
+   * verhindert auch das Umschalten des Häkchens.
+   * Eigenschaften: Klicks im Bereich werden verworfen, außer auf Links und auf
+   * die Überschrift „Eigenschaften“ (Ein- und Ausklappen).
+   * @param {MouseEvent} evt
+   */
+  onGuardClick(evt) {
+    const target = /** @type {Element | null} */ (evt.target);
+    if (!target || typeof target.closest !== 'function') return;
+    if (
+      this.settings.readOnlyCheckboxes &&
+      target.matches('input.task-list-item-checkbox') &&
+      target.closest('.markdown-preview-view, .markdown-rendered')
+    ) {
+      this.stopEvent(evt);
+      return;
+    }
+    if (this.settings.lockReadingView && target.closest(PROPERTIES_SELECTOR) && !target.closest('a, .metadata-properties-heading')) {
+      this.stopEvent(evt);
+    }
+  }
+
+  /**
+   * Eigenschaften: Felder bekommen keinen Fokus, damit nichts per Tastatur
+   * geändert werden kann.
+   * @param {FocusEvent} evt
+   */
+  onGuardFocus(evt) {
+    if (!this.settings.lockReadingView) return;
+    const target = /** @type {HTMLElement | null} */ (evt.target);
+    if (!target || typeof target.closest !== 'function' || !target.closest(PROPERTIES_SELECTOR)) return;
+    if (target.closest('a, .metadata-properties-heading')) return;
+    if (typeof target.blur === 'function') target.blur();
+  }
+
+  /**
+   * Eigenschaften: Eingaben, Einfügen, Ausschneiden und Ablegen verwerfen.
+   * @param {Event} evt
+   */
+  onGuardInput(evt) {
+    if (!this.settings.lockReadingView) return;
+    const target = /** @type {Element | null} */ (evt.target);
+    if (!target || typeof target.closest !== 'function' || !target.closest(PROPERTIES_SELECTOR)) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    evt.stopImmediatePropagation();
+  }
+
+  /**
+   * Kontextmenü auf einem Link zu einer fehlenden Datei: „In neuem Tab
+   * öffnen“ würde die Notiz anlegen. Stattdessen der Hinweis wie beim Klick.
+   * @param {MouseEvent} evt
+   */
+  onContextMenu(evt) {
+    if (!this.settings.blockUnresolvedLinks) return;
+    const target = /** @type {Element | null} */ (evt.target);
+    if (!target || typeof target.closest !== 'function') return;
+    const a = target.closest('a.is-unresolved');
+    if (!a || !a.closest('.markdown-preview-view, .markdown-rendered')) return;
+    this.stopEvent(evt);
+    const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
+    new Notice(`Link-Ziel nicht im Vault: ${safeDecode(href)}`);
   }
 
   /* ---------- Leseansicht ---------- */
@@ -1691,6 +2010,8 @@ class ClaudeMarkdownViewer extends Plugin {
 
   /** @param {import('obsidian').TAbstractFile} file */
   onFileModified(file) {
+    // Die Datei kann jetzt kürzer sein: Docs-Erkennung neu bestimmen.
+    this.docsFlagByPath.delete(file.path);
     if (!(file instanceof TFile) || !this.pathsWithRegions.has(file.path)) return;
     const old = this.rerenderTimers.get(file.path);
     if (old) window.clearTimeout(old);
@@ -1712,9 +2033,39 @@ class ClaudeMarkdownViewer extends Plugin {
    * @param {string} oldPath
    */
   onFileRenamed(file, oldPath) {
+    if (this.pathsWithRegions.delete(oldPath)) this.pathsWithRegions.add(file.path);
+    this.docsFlagByPath.delete(oldPath);
     if (moveFileModes(this.settings.fileModes, oldPath, file.path)) {
       void this.saveData(this.settings);
     }
+  }
+
+  /**
+   * Merkt sich die Docs-Erkennung einer Datei. Ein kürzerer Text (Ausschnitt
+   * aus einer verschachtelten Darstellung) überschreibt nie das Ergebnis aus
+   * der ganzen Datei.
+   * @param {string} path
+   * @param {string} text
+   * @param {boolean} flag
+   * @returns {boolean} gültige Erkennung für die Datei
+   */
+  rememberDocsFlag(path, text, flag) {
+    if (!path) return flag;
+    const prev = this.docsFlagByPath.get(path);
+    if (prev && prev.len > text.length) return prev.flag;
+    this.docsFlagByPath.set(path, { flag, len: text.length, mark: /<mark[\s>]/i.test(text) });
+    return flag;
+  }
+
+  /**
+   * <details>- und Kommentarbereiche eines Texts, je nach Einstellung.
+   * @param {string[]} lines
+   * @param {boolean[]} mask
+   */
+  findRegions(lines, mask) {
+    const details = this.settings.renderDetails ? findDetailsRegions(lines, mask) : [];
+    const comments = this.settings.obsidianSyntaxAsText ? findCommentRegions(lines, mask) : [];
+    return { details, comments, regions: mergeRegions(details, comments) };
   }
 
   /* ---------- Darstellung je Datei ---------- */
@@ -1901,14 +2252,21 @@ class ClaudeMarkdownViewer extends Plugin {
     if (cached && cached.text === text) return cached;
     const lines = splitLines(text);
     const mask = computeProtectedMask(lines);
-    const regions = findDetailsRegions(lines, mask);
-    const isDocs = isDocsExport(text, sourcePath, parseFolderList(this.settings.docsFolders));
+    const found = this.findRegions(lines, mask);
+    const isDocs = this.rememberDocsFlag(sourcePath, text, isDocsExport(text, sourcePath, parseFolderList(this.settings.docsFolders)));
     const footnotes = collectFootnotes(lines, mask);
-    const analysis = { text, lines, regions, isDocs, footnotes };
+    const analysis = {
+      text,
+      lines,
+      regions: found.regions,
+      hasDetails: found.details.length > 0,
+      hasComments: found.comments.length > 0,
+      isDocs,
+      footnotes,
+    };
     if (this.analysisByDoc.size > 50) this.analysisByDoc.clear();
     this.analysisByDoc.set(docId, analysis);
-    if (regions.length) this.pathsWithRegions.add(sourcePath);
-    if (sourcePath) this.docsFlagByPath.set(sourcePath, isDocs);
+    if (found.regions.length && sourcePath) this.pathsWithRegions.add(sourcePath);
     return analysis;
   }
 
@@ -1930,18 +2288,20 @@ class ClaudeMarkdownViewer extends Plugin {
     const text = info.text;
     const mayHaveDetails = s.renderDetails && /<details/i.test(text);
     const mayHaveDelims = text.includes('\\(') || text.includes('\\[');
+    const mayHaveComments = s.obsidianSyntaxAsText && text.includes('%%');
     const multiLine = info.lineEnd > info.lineStart;
-    if (!mayHaveDetails && !mayHaveDelims && !multiLine) return;
+    if (!mayHaveDetails && !mayHaveDelims && !mayHaveComments && !multiLine) return;
 
     try {
       const a = this.analyze(text, ctx.docId, ctx.sourcePath);
       const style = resolveStyle(s, ctx.sourcePath, a.isDocs);
       const opts = {
-        details: mayHaveDetails && a.regions.length > 0,
+        details: mayHaveDetails && a.hasDetails,
+        comments: mayHaveComments && a.hasComments,
         delims: mayHaveDelims && style === 'chat',
         breaks: this.breakTransformFor(ctx.sourcePath, style),
       };
-      if (!opts.details && !opts.delims && !opts.breaks) return;
+      if (!a.regions.length && !opts.comments && !opts.delims && !opts.breaks) return;
       const res = buildSectionMarkdown(a.lines, info.lineStart, info.lineEnd, a.regions, opts);
       if (!res.changed) return;
       if (res.markdown.trim() === '') {
@@ -1967,16 +2327,51 @@ class ClaudeMarkdownViewer extends Plugin {
     }
   }
 
-  /** @param {HTMLElement} el */
-  processDom(el) {
+  /**
+   * @param {HTMLElement} el
+   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
+   */
+  processDom(el, ctx) {
     const s = this.settings;
     try {
       if (s.embedPlaceholders) decorateEmbedPlaceholders(el);
       if (s.scrollableTables) wrapTables(el);
       if (s.linkifyWww) linkifyWww(el);
+      if (s.obsidianSyntaxAsText) {
+        plainTags(el);
+        if (el.querySelector('mark')) this.unwrapHighlights(el, ctx);
+      }
     } catch (err) {
       console.error(LOG_PREFIX, 'Fehler bei der Nachbearbeitung', err);
     }
+  }
+
+  /**
+   * ==Markierung== als Text, aber nur bei Chat/Code und Norm. In Docs-Exporten
+   * ist == eine echte Markierung. Enthält die Datei ein wörtliches <mark>-Tag,
+   * bleibt alles, wie es ist (im DOM nicht unterscheidbar).
+   * @param {HTMLElement} el
+   * @param {import('obsidian').MarkdownPostProcessorContext} ctx
+   */
+  unwrapHighlights(el, ctx) {
+    const path = (ctx && ctx.sourcePath) || '';
+    let entry = this.docsFlagByPath.get(path);
+    if (!entry && ctx) {
+      /** @type {import('obsidian').MarkdownSectionInformation | null} */
+      let info = null;
+      try {
+        info = ctx.getSectionInfo(el);
+      } catch (_e) {
+        info = null;
+      }
+      if (info) {
+        this.rememberDocsFlag(path, info.text, isDocsExport(info.text, path, parseFolderList(this.settings.docsFolders)));
+        entry = this.docsFlagByPath.get(path);
+      }
+    }
+    if (!entry || entry.mark) return;
+    if (resolveStyle(this.settings, path, entry.flag) === 'docs') return;
+    unwrapMarks(el);
   }
 
   /* ---------- Claude-Docs-Erkennung ---------- */
@@ -1989,7 +2384,7 @@ class ClaudeMarkdownViewer extends Plugin {
   async isDocsContext(el, ctx) {
     const folders = parseFolderList(this.settings.docsFolders);
     const path = ctx.sourcePath || '';
-    if (path && folders.some((f) => path === f || path.startsWith(f + '/'))) return true;
+    if (inDocsFolder(path, folders)) return true;
     /** @type {import('obsidian').MarkdownSectionInformation | null} */
     let info = null;
     try {
@@ -1998,19 +2393,15 @@ class ClaudeMarkdownViewer extends Plugin {
       info = null;
     }
     if (info && info.lineStart >= 0) {
-      const flag = isDocsExport(info.text, path, folders);
-      if (path) this.docsFlagByPath.set(path, flag);
-      return flag;
+      return this.rememberDocsFlag(path, info.text, isDocsExport(info.text, path, folders));
     }
     const cached = this.docsFlagByPath.get(path);
-    if (cached !== undefined) return cached;
+    if (cached) return cached.flag;
     const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
     if (file instanceof TFile) {
       try {
         const text = await this.app.vault.cachedRead(file);
-        const flag = isDocsExport(text, path, folders);
-        this.docsFlagByPath.set(path, flag);
-        return flag;
+        return this.rememberDocsFlag(path, text, isDocsExport(text, path, folders));
       } catch (_e) {
         return false;
       }
@@ -2271,6 +2662,7 @@ class ClaudeMarkdownViewer extends Plugin {
         const md = transformMarkdown(source, {
           details: this.settings.renderDetails,
           delims: style === 'chat',
+          comments: this.settings.obsidianSyntaxAsText,
           breaks: this.breakTransformFor(path, style),
         });
         try {
@@ -2360,10 +2752,21 @@ class ClaudeMarkdownViewer extends Plugin {
       pathPart === '' ||
       (file !== null && (pathPart === file.path || pathPart === file.name || pathPart === file.basename));
     if (sameFile) {
-      const target = resolveAnchor(buildHeadingIndex(view.data || view.getViewData()), anchor);
-      if (!target || target.exact) return false;
+      const text = view.data || view.getViewData();
+      const index = buildHeadingIndex(text);
+      const target = resolveAnchor(index, anchor);
+      if (!target) return false;
+      // Liegt das Ziel in einem Klapp- oder Kommentarbereich, steckt die
+      // Überschrift im ersten Abschnitt des Bereichs; ihr eigener Abschnitt ist
+      // ausgeblendet. Dann im DOM suchen statt über die Zeile springen.
+      const lines = splitLines(text);
+      const region = this.findRegions(lines, computeProtectedMask(lines)).regions.find(
+        (r) => r.start <= target.line && target.line <= r.end
+      );
+      if (target.exact && !region) return false;
       this.stopEvent(evt);
-      this.scrollToLine(view, target.line, target.heading ? target.heading.raw : null);
+      if (region && target.heading && this.scrollToHeadingInDom(view, index, target.heading)) return true;
+      this.scrollToLine(view, region ? region.start : target.line, target.heading ? target.heading.raw : null);
       return true;
     }
     const sourcePath = file ? file.path : '';
@@ -2399,6 +2802,36 @@ class ClaudeMarkdownViewer extends Plugin {
         console.error(LOG_PREFIX, 'Sprung zur Überschrift fehlgeschlagen', err);
       }
     }
+  }
+
+  /**
+   * Sucht die Überschrift in der Leseansicht und scrollt zu ihr. Liegt sie in
+   * eingeklappten Bereichen, werden diese zuerst aufgeklappt (nur Anzeige).
+   * @param {import('obsidian').MarkdownView} view
+   * @param {HeadingIndex} index
+   * @param {HeadingEntry} heading
+   * @returns {boolean} false, wenn die Überschrift nicht im DOM steht
+   */
+  scrollToHeadingInDom(view, index, heading) {
+    const want = heading.text;
+    const nth = index.headings.filter((h) => h.text === want).indexOf(heading);
+    const root = view.containerEl.querySelector('.markdown-preview-view') || view.containerEl;
+    const found = Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6')).filter(
+      (h) => !h.closest('.cmv-hidden') && (h.textContent || '').replace(/\s+/g, ' ').trim() === want
+    );
+    const el = found[Math.max(0, nth)] || found[0];
+    if (!el) return false;
+    /** @type {Element[]} */
+    const collapsed = [];
+    for (let c = el.closest('.callout.is-collapsed'); c; c = c.parentElement ? c.parentElement.closest('.callout.is-collapsed') : null) {
+      collapsed.unshift(c);
+    }
+    for (const c of collapsed) {
+      const title = /** @type {HTMLElement | null} */ (c.querySelector(':scope > .callout-title'));
+      if (title) title.click();
+    }
+    window.setTimeout(() => el.scrollIntoView({ block: 'start' }), collapsed.length ? 80 : 0);
+    return true;
   }
 }
 
@@ -2475,15 +2908,17 @@ class ViewerSettingTab extends PluginSettingTab {
       .setDesc(
         'Optional, kommagetrennt, z. B. „Claude/Docs“. Dateien darin gelten immer als Docs-Export. Ohne Angabe erkennt das Plugin Exporte an der Datumszeile unter dem Titel und an Diagramm-Platzhaltern.'
       )
-      .addText((t) =>
-        t
-          .setPlaceholder('Claude/Docs')
+      .addText((t) => {
+        // Erst speichern und neu darstellen, wenn eine Weile nichts getippt wurde.
+        const saveSoon =
+          typeof debounce === 'function' ? debounce(() => void plugin.saveSettings(), 800, true) : () => void plugin.saveSettings();
+        t.setPlaceholder('Claude/Docs')
           .setValue(plugin.settings.docsFolders)
-          .onChange(async (value) => {
+          .onChange((value) => {
             plugin.settings.docsFolders = value;
-            await plugin.saveSettings();
-          })
-      );
+            saveSoon();
+          });
+      });
     const count = Object.keys(plugin.settings.fileModes).length;
     new Setting(containerEl)
       .setName('Dateien mit eigener Darstellung')
@@ -2507,16 +2942,25 @@ class ViewerSettingTab extends PluginSettingTab {
     toggle(
       'lockReadingView',
       'Immer Leseansicht',
-      'Markdown-Dateien öffnen in der Leseansicht. Ein Wechsel in den Bearbeitungsmodus wird sofort zurückgenommen. Das Plugin selbst hat keine Bearbeitungsfunktionen, auch nicht für Tabellen.'
+      'Markdown-Dateien öffnen in der Leseansicht. Ein Wechsel in den Bearbeitungsmodus wird sofort zurückgenommen. Eigenschaften (Frontmatter) sind nur sichtbar, nicht änderbar. Das Plugin selbst hat keine Bearbeitungsfunktionen, auch nicht für Tabellen.'
     );
-    toggle('readOnlyCheckboxes', 'Checkboxen nicht anklickbar', 'Ein Klick auf eine Aufgaben-Checkbox würde sonst die Datei ändern.');
+    toggle(
+      'readOnlyCheckboxes',
+      'Checkboxen nicht anklickbar',
+      'Ein Klick oder die Leertaste auf einer Aufgaben-Checkbox würde sonst die Datei ändern.'
+    );
     toggle(
       'blockUnresolvedLinks',
       'Keine Notizen durch Link-Klick anlegen',
-      'Obsidian legt beim Klick auf einen Link zu einer fehlenden Datei eine neue Notiz an. Stattdessen erscheint ein Hinweis.'
+      'Obsidian legt beim Klick auf einen Link zu einer fehlenden Datei eine neue Notiz an, auch über das Kontextmenü. Stattdessen erscheint ein Hinweis.'
     );
 
     new Setting(containerEl).setName('Zusätzlich, in jeder Darstellung').setHeading();
+    toggle(
+      'obsidianSyntaxAsText',
+      'Obsidian-Sonderzeichen als Text',
+      'Claude kennt diese Obsidian-Syntax nicht: %% beginnt einen Kommentar (ein einzelnes %% blendet den Rest der Datei aus), #wort wird ein Tag, ==wort== eine Markierung. Eingeschaltet steht der Text da wie geschrieben. ==Markierung== bleibt bei Docs-Exporten erhalten.'
+    );
     toggle('renderDetails', '<details> ausklappbar mit Markdown-Inhalt', 'Auch mit Leerzeilen, Code, Tabellen und Verschachtelung.');
     toggle('githubAnchors', 'GitHub-Ankerlinks auflösen', 'Links wie [Abschnitt](#mein-abschnitt) springen zur passenden Überschrift.');
     toggle('embedPlaceholders', 'Diagramm-Platzhalter hervorheben', 'Docs-Exporte enthalten statt Charts nur „[embedded content: …]“.');
@@ -2570,6 +3014,13 @@ class ViewerSettingTab extends PluginSettingTab {
   wrapTables,
   linkifyWww,
   decorateFootnoteRefs,
+  findCommentRegions,
+  escapeComments,
+  mergeRegions,
+  listItemBreaksParagraph,
+  inDocsFolder,
+  plainTags,
+  unwrapMarks,
   DEFAULT_SETTINGS,
 };
 

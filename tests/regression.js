@@ -18,7 +18,12 @@ const obsidianMock = {
   },
   PluginSettingTab: class {},
   Setting: class {},
-  MarkdownRenderer: { render: async () => {} },
+  MarkdownRenderer: {
+    // Merkt sich, was neu dargestellt würde.
+    render: async (_app, markdown, el) => {
+      el.rendered = markdown;
+    },
+  },
   MarkdownRenderChild: class {},
   MarkdownView,
   Notice: class {},
@@ -29,6 +34,7 @@ const obsidianMock = {
   renderMath: () => null,
   finishRenderMath: async () => {},
   loadPrism: async () => null,
+  debounce: (fn) => fn,
 };
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
@@ -41,13 +47,19 @@ const T = Plugin.__test;
 
 let failed = 0;
 /** @param {string} name @param {() => void} fn */
+const queue = [];
 function test(name, fn) {
-  try {
-    fn();
-    console.log('ok   ' + name);
-  } catch (err) {
-    failed++;
-    console.log('FAIL ' + name + '\n     ' + String(err && err.message).split('\n').join('\n     '));
+  queue.push({ name, fn });
+}
+async function runAll() {
+  for (const { name, fn } of queue) {
+    try {
+      await fn();
+      console.log('ok   ' + name);
+    } catch (err) {
+      failed++;
+      console.log('FAIL ' + name + '\n     ' + String(err && err.message).split('\n').join('\n     '));
+    }
   }
 }
 
@@ -139,5 +151,160 @@ test('Klick auf Ankerlink #test springt weiterhin zur Überschrift', () => {
   assert.strictEqual(r.scrolledTo, 4);
 });
 
-console.log(failed ? `\n${failed} Test(s) fehlgeschlagen` : '\nAlle Tests bestanden');
-process.exit(failed ? 1 : 0);
+/* ---------- 1.2.0: %%-Kommentare ---------- */
+
+test('%% ohne Gegenstück: Kommentarbereich bis Dateiende', () => {
+  const lines = ['# T', '', 'Prozent 50 %% sowie mehr', '', '## Weiter', '', 'Text'];
+  const mask = T.computeProtectedMask(lines);
+  assert.deepStrictEqual(T.findCommentRegions(lines, mask), [{ start: 2, end: 6 }]);
+});
+
+test('%% in Code zählt nicht, Paare schließen', () => {
+  const lines = ['a %%b%% c', '`%%` code', '```', '%%', '```', 'x'];
+  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), [{ start: 0, end: 0 }]);
+});
+
+test('escapeComments ersetzt %% nur außerhalb von Code', () => {
+  assert.strictEqual(
+    T.escapeComments('50 %% und `%%`\n```\n%%\n```\nEnde %%'),
+    '50 &#37;&#37; und `%%`\n```\n%%\n```\nEnde &#37;&#37;'
+  );
+});
+
+/**
+ * Minimale Attrappe eines Abschnitts der Leseansicht.
+ * @param {number} lineStart @param {number} lineEnd @param {string} text
+ */
+function fakeSection(lineStart, lineEnd, text) {
+  const classes = new Set();
+  const el = {
+    rendered: null,
+    childNodes: [],
+    classList: { contains: (c) => classes.has(c) },
+    addClass: (c) => classes.add(c),
+    removeClass: (c) => classes.delete(c),
+    empty: () => {},
+    appendChild: () => {},
+    textContent: '',
+    classes,
+  };
+  const ctx = {
+    docId: 'doc-1',
+    sourcePath: 'docs.md',
+    addChild: () => {},
+    getSectionInfo: () => ({ text, lineStart, lineEnd }),
+  };
+  return { el, ctx };
+}
+
+test('processSection: Abschnitt mit %% zeigt den Rest der Datei, %% als Text', async () => {
+  const text = '# Titel\n\nNov 16, 2026 · @Name\n\nProzent 50 %% sowie mehr.\n\n## Tabellen\n\n| a | b |\n| - | - |\n| 1 | 2 |\n';
+  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
+  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
+  const first = fakeSection(4, 4, text);
+  await plugin.processSection(first.el, first.ctx);
+  assert.ok(first.el.rendered, 'Abschnitt wurde nicht neu dargestellt');
+  assert.ok(first.el.rendered.includes('Prozent 50 &#37;&#37; sowie mehr.'));
+  assert.ok(first.el.rendered.includes('## Tabellen'));
+  assert.ok(first.el.rendered.includes('| 1 | 2 |'));
+  const later = fakeSection(6, 6, text);
+  await plugin.processSection(later.el, later.ctx);
+  assert.ok(later.el.classes.has('cmv-hidden'), 'späterer Abschnitt ist nicht ausgeblendet');
+});
+
+/* ---------- 1.2.0: <details> ---------- */
+
+test('Fließtext mit <details> am Zeilenanfang wird kein Klappbereich', () => {
+  const lines = ['<details> ist ein HTML-Element.', '', 'Text', '', 'Man schließt mit </details> ab.'];
+  assert.deepStrictEqual(T.findDetailsRegions(lines, T.computeProtectedMask(lines)), []);
+});
+
+test('<details> in einem Listenpunkt bleibt in der Liste', () => {
+  const out = T.convertDetailsInText('1. Punkt\n   <details>\n   <summary>Mehr</summary>\n\n   - innen\n\n   </details>\n2. Weiter');
+  assert.strictEqual(out, '1. Punkt\n\n   > [!claude-details]- Mehr\n   > - innen\n\n2. Weiter');
+});
+
+test('<details open> und einzeiliges <details> werden erkannt', () => {
+  const a = ['<details open>', '<summary>S</summary>', '', 'x', '', '</details>'];
+  assert.deepStrictEqual(T.findDetailsRegions(a, T.computeProtectedMask(a)), [{ start: 0, end: 5 }]);
+  const b = ['<details><summary>A</summary>x</details>'];
+  assert.deepStrictEqual(T.findDetailsRegions(b, T.computeProtectedMask(b)), [{ start: 0, end: 0 }]);
+});
+
+/* ---------- 1.2.0: Zeilenumbrüche nach CommonMark ---------- */
+
+test('„2024. Jahr“ nach einer Absatzzeile ist Absatztext, keine Liste', () => {
+  assert.strictEqual(T.convertSoftBreaks('Seit\n2024. Jahr. Fazit:\n2. Punkt', 'join'), 'Seit 2024. Jahr. Fazit: 2. Punkt');
+  assert.strictEqual(T.convertSoftBreaks('1. a\n2. b\n3. c', 'join'), '1. a\n2. b\n3. c');
+  assert.strictEqual(T.convertSoftBreaks('Text\n1. a\n2. b', 'join'), 'Text\n1. a\n2. b');
+});
+
+/* ---------- 1.2.0: Kleinigkeiten ---------- */
+
+test('Mehrzeilige Fußnote: ganzer Text im Tooltip', () => {
+  const lines = ['Text[^a].', '[^a]: Erste Zeile', '    zweite Zeile', '', '    zweiter Absatz', 'Danach'];
+  assert.strictEqual(T.collectFootnotes(lines, new Array(lines.length).fill(false)).defs.get('a'), 'Erste Zeile zweite Zeile zweiter Absatz');
+});
+
+test('Slug: hochgestellte Ziffern fallen weg wie bei GitHub', () => {
+  assert.strictEqual(T.githubSlug('x²'), 'x');
+  assert.strictEqual(T.githubSlug('Ⅻ Kapitel'), 'ⅻ-kapitel');
+});
+
+test('Docs-Ordner: Groß- und Kleinschreibung egal, kein Präfix-Treffer', () => {
+  assert.strictEqual(T.inDocsFolder('claude/docs/a.md', ['Claude/Docs']), true);
+  assert.strictEqual(T.inDocsFolder('Claude/DocsAlt/a.md', ['Claude/Docs']), false);
+});
+
+/* ---------- 1.2.0: Nur ansehen ---------- */
+
+/** @param {{ matches?: string, inside?: string[] }} spec */
+function guardTarget(spec) {
+  const inside = spec.inside || [];
+  return {
+    matches: (sel) => sel === spec.matches,
+    closest: (sel) => (sel.split(',').some((s) => inside.some((i) => s.trim().includes(i))) ? {} : null),
+    blurred: false,
+    blur() {
+      this.blurred = true;
+    },
+  };
+}
+
+function guardPlugin() {
+  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] } }, {});
+  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
+  return plugin;
+}
+
+function fakeEvent(target) {
+  const e = { target, prevented: false, preventDefault() { this.prevented = true; }, stopPropagation() {}, stopImmediatePropagation() {} };
+  return e;
+}
+
+test('Checkbox: Klick (auch per Leertaste) wird verworfen', () => {
+  const e = fakeEvent(guardTarget({ matches: 'input.task-list-item-checkbox', inside: ['.markdown-preview-view'] }));
+  guardPlugin().onGuardClick(e);
+  assert.strictEqual(e.prevented, true);
+});
+
+test('Eigenschaften: kein Fokus, keine Eingabe', () => {
+  const t = guardTarget({ inside: ['.metadata-container'] });
+  const p = guardPlugin();
+  p.onGuardFocus(fakeEvent(t));
+  assert.strictEqual(t.blurred, true);
+  const e = fakeEvent(t);
+  p.onGuardInput(e);
+  assert.strictEqual(e.prevented, true);
+});
+
+test('Eigenschaften: Link bleibt anklickbar', () => {
+  const e = fakeEvent(guardTarget({ inside: ['.metadata-container', 'a'] }));
+  guardPlugin().onGuardClick(e);
+  assert.strictEqual(e.prevented, false);
+});
+
+runAll().then(() => {
+  console.log(failed ? `\n${failed} Test(s) fehlgeschlagen` : '\nAlle Tests bestanden');
+  process.exit(failed ? 1 : 0);
+});
