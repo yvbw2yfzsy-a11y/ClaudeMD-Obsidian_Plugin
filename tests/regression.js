@@ -153,10 +153,14 @@ test('Klick auf Ankerlink #test springt weiterhin zur Überschrift', () => {
 
 /* ---------- 1.2.0: %%-Kommentare ---------- */
 
-test('%% ohne Gegenstück: Kommentarbereich bis Dateiende', () => {
+test('Einzelnes %% bleibt Text (so zeigt es die Leseansicht), kein Bereich', () => {
   const lines = ['# T', '', 'Prozent 50 %% sowie mehr', '', '## Weiter', '', 'Text'];
-  const mask = T.computeProtectedMask(lines);
-  assert.deepStrictEqual(T.findCommentRegions(lines, mask), [{ start: 2, end: 6 }]);
+  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), []);
+});
+
+test('%%-Paar über mehrere Absätze ergibt einen Bereich', () => {
+  const lines = ['a 50 %% b', '', 'c', '', 'd 70 %% e'];
+  assert.deepStrictEqual(T.findCommentRegions(lines, T.computeProtectedMask(lines)), [{ start: 0, end: 4 }]);
 });
 
 test('%% in Code zählt nicht, Paare schließen', () => {
@@ -185,6 +189,7 @@ function fakeSection(lineStart, lineEnd, text) {
     removeClass: (c) => classes.delete(c),
     empty: () => {},
     appendChild: () => {},
+    querySelectorAll: () => [],
     textContent: '',
     classes,
   };
@@ -197,19 +202,33 @@ function fakeSection(lineStart, lineEnd, text) {
   return { el, ctx };
 }
 
-test('processSection: Abschnitt mit %% zeigt den Rest der Datei, %% als Text', async () => {
-  const text = '# Titel\n\nNov 16, 2026 · @Name\n\nProzent 50 %% sowie mehr.\n\n## Tabellen\n\n| a | b |\n| - | - |\n| 1 | 2 |\n';
+test('processSection: %%-Paar über Absätze erscheint als Text, Folgeabschnitt ausgeblendet', async () => {
+  const text = '# Titel\n\nRabatt 50 %% und\n\n## Mitte\n\nbis 70 %% gesamt.\n\nEnde\n';
   const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
   plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
-  const first = fakeSection(4, 4, text);
+  const first = fakeSection(2, 2, text);
   await plugin.processSection(first.el, first.ctx);
   assert.ok(first.el.rendered, 'Abschnitt wurde nicht neu dargestellt');
-  assert.ok(first.el.rendered.includes('Prozent 50 &#37;&#37; sowie mehr.'));
-  assert.ok(first.el.rendered.includes('## Tabellen'));
-  assert.ok(first.el.rendered.includes('| 1 | 2 |'));
-  const later = fakeSection(6, 6, text);
+  assert.ok(first.el.rendered.includes('Rabatt 50 &#37;&#37; und'));
+  assert.ok(first.el.rendered.includes('## Mitte'));
+  assert.ok(first.el.rendered.includes('bis 70 &#37;&#37; gesamt.'));
+  assert.ok(!first.el.rendered.includes('Ende'));
+  const later = fakeSection(4, 4, text);
   await plugin.processSection(later.el, later.ctx);
-  assert.ok(later.el.classes.has('cmv-hidden'), 'späterer Abschnitt ist nicht ausgeblendet');
+  assert.ok(later.el.classes.has('cmv-hidden'), 'Abschnitt im Bereich ist nicht ausgeblendet');
+  const after = fakeSection(8, 8, text);
+  await plugin.processSection(after.el, after.ctx);
+  assert.ok(!after.el.classes.has('cmv-hidden') && !after.el.rendered, 'Abschnitt nach dem Bereich wurde verändert');
+});
+
+test('processSection: einzelnes %% im Docs-Export lässt den Abschnitt unverändert', async () => {
+  const text = '# Titel\n\nNov 16, 2026 · @Name\n\nProzent 50 %% sowie mehr.\n';
+  const plugin = new Plugin({ workspace: { getLeavesOfType: () => [] }, vault: {}, metadataCache: {} }, {});
+  plugin.settings = Object.assign({}, T.DEFAULT_SETTINGS, { fileModes: {} });
+  const sec = fakeSection(4, 4, text);
+  await plugin.processSection(sec.el, sec.ctx);
+  assert.strictEqual(sec.el.rendered, null);
+  assert.ok(!sec.el.classes.has('cmv-hidden'));
 });
 
 /* ---------- 1.2.0: <details> ---------- */

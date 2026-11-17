@@ -523,9 +523,11 @@ function convertDetailsInText(md, withFrontmatter = true) {
 /* ---------- Obsidian-Kommentare %%…%% ---------- */
 
 /**
- * Zeilenbereiche, die Obsidian als Kommentar %%…%% behandelt. Claude kennt
- * diese Syntax nicht. Ein einzelnes %% (etwa „Prozent 50 %%“) macht in
- * Obsidian den ganzen Rest der Datei zum Kommentar. %% in Code zählt nicht.
+ * Zeilenbereiche, die Obsidian in der Leseansicht als Kommentar %%…%%
+ * ausblendet. Claude kennt diese Syntax nicht. Gezählt werden nur Paare: Ein
+ * einzelnes %% (etwa „Prozent 50 %%“) zeigt die Leseansicht als Text (am
+ * iPad geprüft); nur der Bearbeitungsmodus färbt dann den Rest als Kommentar.
+ * %% in Code zählt nicht.
  * @param {string[]} lines
  * @param {boolean[]} mask
  * @returns {Array<{ start: number, end: number }>}
@@ -546,7 +548,6 @@ function findCommentRegions(lines, mask) {
       }
     }
   }
-  if (open !== -1) regions.push({ start: open, end: lines.length - 1 });
   return regions;
 }
 
@@ -1473,8 +1474,10 @@ function unwrapMarks(root) {
 }
 
 /**
- * Macht aus wörtlichem "[^1]" in neu dargestellten Abschnitten wieder eine
- * hochgestellte Fußnotennummer mit Tooltip.
+ * Macht aus wörtlichem "[^1]" in neu dargestellten Abschnitten wieder ein
+ * hochgestelltes Fußnotenzeichen „[1]“ wie bei Obsidian, mit Tooltip. Das
+ * Plugin hängt einen Tipp-Handler an (data-fn), der zur Fußnote springt;
+ * auf dem iPad gibt es keinen Tooltip.
  * @param {HTMLElement} root
  * @param {{ defs: Map<string, string>, order: Map<string, number> }} fn
  */
@@ -1502,9 +1505,12 @@ function decorateFootnoteRefs(root, fn) {
       frag.append(text.slice(last, m.index));
       const sup = doc.createElement('sup');
       sup.className = 'footnote-ref cmv-fnref';
-      sup.textContent = String(fn.order.get(m[1]) || m[1]);
+      const num = fn.order.get(m[1]);
+      sup.textContent = `[${num || m[1]}]`;
+      if (num) sup.setAttribute('data-fn', String(num));
       sup.setAttribute('title', def);
-      sup.setAttribute('aria-label', `Fußnote ${sup.textContent}: ${def}`);
+      sup.setAttribute('role', 'link');
+      sup.setAttribute('aria-label', `Fußnote ${num || m[1]}: ${def}`);
       frag.append(sup);
       last = m.index + m[0].length;
     }
@@ -2316,6 +2322,7 @@ class ClaudeMarkdownViewer extends Plugin {
       try {
         await MarkdownRenderer.render(this.app, res.markdown, el, ctx.sourcePath, child);
         decorateFootnoteRefs(el, a.footnotes);
+        this.wireFootnoteRefs(el);
       } catch (err) {
         console.error(LOG_PREFIX, 'Abschnitt konnte nicht neu dargestellt werden', err);
         el.empty();
@@ -2324,6 +2331,27 @@ class ClaudeMarkdownViewer extends Plugin {
       }
     } catch (err) {
       console.error(LOG_PREFIX, 'Fehler bei der Abschnittsanalyse', err);
+    }
+  }
+
+  /**
+   * Fußnotenzeichen aus decorateFootnoteRefs: Tippen springt zur Fußnote am
+   * Dateiende. Ist dieser Teil noch nicht dargestellt, erscheint ihr Text als
+   * Hinweis.
+   * @param {HTMLElement} el
+   */
+  wireFootnoteRefs(el) {
+    for (const ref of Array.from(el.querySelectorAll('.cmv-fnref[data-fn]'))) {
+      ref.addEventListener('click', (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const n = Number(ref.getAttribute('data-fn'));
+        const root = ref.closest('.markdown-preview-view');
+        const items = root ? Array.from(root.querySelectorAll('.footnotes li')) : [];
+        const li = items.find((item) => (item.id || '').startsWith(`fn-${n}-`)) || items[n - 1];
+        if (li) li.scrollIntoView({ block: 'center' });
+        else new Notice(`Fußnote ${n}: ${ref.getAttribute('title') || ''}`, 8000);
+      });
     }
   }
 
@@ -2959,14 +2987,18 @@ class ViewerSettingTab extends PluginSettingTab {
     toggle(
       'obsidianSyntaxAsText',
       'Obsidian-Sonderzeichen als Text',
-      'Claude kennt diese Obsidian-Syntax nicht: %% beginnt einen Kommentar (ein einzelnes %% blendet den Rest der Datei aus), #wort wird ein Tag, ==wort== eine Markierung. Eingeschaltet steht der Text da wie geschrieben. ==Markierung== bleibt bei Docs-Exporten erhalten.'
+      'Claude kennt diese Obsidian-Syntax nicht: Text zwischen zwei %% blendet Obsidian als Kommentar aus, #wort wird ein Tag, ==wort== eine Markierung. Eingeschaltet steht der Text da wie geschrieben. ==Markierung== bleibt bei Docs-Exporten erhalten.'
     );
     toggle('renderDetails', '<details> ausklappbar mit Markdown-Inhalt', 'Auch mit Leerzeilen, Code, Tabellen und Verschachtelung.');
     toggle('githubAnchors', 'GitHub-Ankerlinks auflösen', 'Links wie [Abschnitt](#mein-abschnitt) springen zur passenden Überschrift.');
     toggle('embedPlaceholders', 'Diagramm-Platzhalter hervorheben', 'Docs-Exporte enthalten statt Charts nur „[embedded content: …]“.');
     toggle('scrollableTables', 'Breite Tabellen scrollbar', 'Statt über den Rand zu laufen.');
     toggle('githubAlertColors', 'GitHub-Farben für Hinweisboxen', 'IMPORTANT violett, CAUTION rot statt der Obsidian-Standardfarben.');
-    toggle('linkifyWww', 'www.-Adressen verlinken', 'Wie GitHub bei Adressen ohne https://.');
+    toggle(
+      'linkifyWww',
+      'www.-Adressen verlinken',
+      'Wie GitHub bei Adressen ohne https://. Aktuelle Obsidian-Versionen tun das selbst; das Plugin ergänzt es nur, wo es fehlt.'
+    );
   }
 }
 

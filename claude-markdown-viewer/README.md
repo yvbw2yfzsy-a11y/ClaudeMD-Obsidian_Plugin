@@ -39,14 +39,15 @@ Die Obsidian-Einstellung „Strenge Zeilenumbrüche“ musst du nicht ändern. D
 | Element | Darstellung mit Plugin |
 | --- | --- |
 | `<details>` | Klappbereich mit vollem Markdown, auch mit Leerzeilen, verschachtelt und in Listen. Erkannt, wenn `<details>` allein oder mit `<summary>` auf der Zeile steht; Fließtext wie „`<details>` ist ein HTML-Element“ bleibt Text. |
-| `%%` | Text. In Obsidian beginnt `%%` einen Kommentar; ein einzelnes `%%` (etwa „50 %%“) blendet den ganzen Rest der Datei aus. |
+| `%%…%%` | Text. Obsidian blendet Text zwischen zwei `%%` als Kommentar aus. Ein einzelnes `%%` (etwa „50 %%“) zeigt die Leseansicht ohnehin als Text. |
 | `#wort` | Text statt Obsidian-Tag (etwa `#include` oder `#ff0000`) |
 | `==wort==` | Text bei Chat/Code und Norm; Markierung bei Docs-Exporten |
 | `[embedded content: …]` | Hinweiskasten: Diagramm fehlt im Docs-Export |
 | `[Text](#github-anker)` | Sprung zur passenden Überschrift, auch in andere Dateien und in Klappbereiche |
 | Hinweisboxen `> [!IMPORTANT]`, `> [!CAUTION]` | GitHub-Farben |
 | breite Tabellen | horizontal scrollbar |
-| `www.`-Adressen | Link, falls Obsidian sie nicht schon selbst verlinkt |
+| `www.`-Adressen | Link (aktuelle Obsidian-Versionen tun das selbst; das Plugin ergänzt es nur, wo es fehlt) |
+| Fußnoten in umgebauten Abschnitten | `[1]` wie bei Obsidian; Tippen springt zur Fußnote am Ende (Tooltip gibt es auf dem iPad nicht) |
 
 Jede dieser Funktionen lässt sich in den Einstellungen abschalten, `%%`, `#wort` und `==wort==` gemeinsam.
 
@@ -79,9 +80,15 @@ In der Befehlspalette (Cmd + P), Präfix „Claude Markdown Viewer“:
 
 ## Änderungen
 
+**1.2.1**
+
+- Korrigiert: Ein einzelnes `%%` gilt nicht mehr als Kommentar bis zum Dateiende. Die Leseansicht zeigt es als Text (am iPad geprüft); nur der Bearbeitungsmodus färbt den Rest grau. Neutralisiert werden nur noch `%%`-Paare. Der Docs-Export bleibt dadurch unangetastet.
+- Fußnoten in umgebauten Abschnitten erscheinen als `[1]` wie bei Obsidian. Tippen springt zur Fußnote am Dateiende oder zeigt ihren Text.
+- Text der Einstellung „www.-Adressen verlinken“ korrigiert: Obsidian verlinkt sie inzwischen selbst.
+
 **1.2.0**
 
-- Neu: `%%` erscheint als Text. Ein einzelnes `%%` blendete bisher den ganzen Rest der Datei als Obsidian-Kommentar aus (im Docs-Test ab „Prozent 50“).
+- Neu: `%%` erscheint als Text. (Die Annahme, ein einzelnes `%%` blende den Rest der Datei aus, stimmte nur für den Bearbeitungsmodus; siehe 1.2.1.)
 - Neu: `#wort` erscheint als Text statt als Obsidian-Tag; `==wort==` bei Chat/Code und Norm als Text. Einstellung „Obsidian-Sonderzeichen als Text“.
 - Neu: Eigenschaften sind in der Leseansicht nicht mehr änderbar. Checkboxen reagieren auch nicht mehr auf die Leertaste. Das Kontextmenü eines Links zu einer fehlenden Datei legt keine Notiz mehr an.
 - Behoben: Fließtext, der mit `<details>` beginnt, wurde zusammen mit allem bis zum nächsten `</details>` eingeklappt.

@@ -271,7 +271,7 @@ body.cmv-readonly-tasks .markdown-rendered input.task-list-item-checkbox {
 /* ---------- Fußnoten in neu dargestellten Abschnitten ---------- */
 .cmv-fnref {
   color: var(--link-color);
-  cursor: help;
+  cursor: pointer;
 }
 
 /* ---------- Eigenschaften (Frontmatter) nur anzeigen ---------- */

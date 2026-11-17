@@ -1,8 +1,25 @@
-# Prüfbericht: Claude Markdown Viewer 1.1.0 bis 1.2.0
+# Prüfbericht: Claude Markdown Viewer 1.1.0 bis 1.2.1
 
 Geprüft wurden `main.js`, `styles.css`, `manifest.json` und `README.md` aus `claude-markdown-viewer-1.1.0.zip` sowie die drei Testdateien. Eine Anleitung, ein Prüfbericht oder die ursprüngliche Anfrage lagen nicht bei und sind deshalb nicht geprüft. Behauptungen in README und Code-Kommentaren wurden als Behauptungen behandelt.
 
-## Stand 1.2.0: Nachtrag nach den iPad-Screenshots
+## Stand 1.2.1: Leseansicht am iPad ohne Plugin
+
+Die zweiten Screenshots zeigen beide Testdateien in der Leseansicht (Stift-Symbol oben rechts), ohne Plugin. Damit sind mehrere Punkte belegt, die vorher nur vermutet oder nur im Bearbeitungsmodus gesehen waren:
+
+| Beobachtung (Leseansicht, ohne Plugin) | Folge |
+| --- | --- |
+| „Prozent 50 %% sowie [[Wikilink]] und #tag.“ steht vollständig da, der Rest der Datei ebenfalls. Ein einzelnes `%%` ist hier **Text**, kein Kommentar. | **K1 war falsch eingeordnet.** Nur der Bearbeitungsmodus färbt den Rest grau. 1.2.0 behandelte ein einzelnes `%%` als Kommentar bis Dateiende und baute den ganzen Rest von Test 2 als einen Block neu. Das sah gleich aus, war aber unnötig. 1.2.1 neutralisiert nur noch `%%`-Paare. |
+| `<details>` in Test 1: Titel zugeklappt, der Inhalt (Fett, Liste, Code, Formel, Tabelle) steht trotzdem sichtbar darunter. | Bestätigt: Ohne Umbau zerfällt `<details>` mit Leerzeilen. Der Umbau zum Klappbereich ist nötig. |
+| `> &#91;!NOTE\] GitHub-Hinweisbox.` bleibt Zitat mit Text „[!NOTE] …“. | Offene Frage beantwortet: wird keine Hinweisbox, passt zu Claude Docs. |
+| `www.example.com` ist ein Link mit Symbol für externe Links. | Obsidian verlinkt `www.` selbst; Einstellungstext korrigiert. Das Plugin überspringt bestehende Links, doppelt wird nichts. |
+| Fußnoten: `[1]` hochgestellt als Link, Liste mit ↩ am Ende. | Die neu dargestellten Abschnitte des Plugins zeigten nur „1“ mit Tooltip. Tooltips gibt es auf dem iPad nicht. 1.2.1: `[1]`, Tippen springt zur Fußnote oder zeigt ihren Text. |
+| `#tag` als Tag-Pille, `==markiert==` markiert, `\<u>…\</u>` als Text, IMPORTANT/CAUTION in Tipp-/Warnfarben, `\(…\)`, `\[…\]` und `math` roh. | Wie erwartet; das Plugin behandelt genau diese Stellen. |
+
+Regressionstests: 21, alle bestanden. Typprüfung ohne Fehler.
+
+## Stand 1.2.0: Nachtrag nach den ersten iPad-Screenshots (Bearbeitungsmodus)
+
+> Korrektur: Diese Screenshots zeigten den Bearbeitungsmodus. Die Aussage „K1 bestätigt“ gilt nur dort; in der Leseansicht ist ein einzelnes `%%` Text (siehe Stand 1.2.1).
 
 Die Screenshots zeigen beide Testdateien **ohne Plugin im Bearbeitungsmodus (Live Preview)**, nicht in der Leseansicht. Erkennbar am Buch-Symbol oben rechts (es schaltet *zur* Leseansicht) und an den Fußnoten, die als `[^1]` im Text und als `¹ Text` an ihrer Stelle stehen statt als Liste am Dateiende. Das Plugin arbeitet nur in der Leseansicht und erzwingt sie. Die Darstellung ist auf iPad und Mac dieselbe; das Plugin läuft auf beiden (`isDesktopOnly: false`).
 
@@ -34,7 +51,7 @@ Was die Screenshots belegen:
 | G18 Slug `x²` | Wie github-slugger. |
 | neu | Ankerlinks auf Überschriften in Klapp- oder Kommentarbereichen suchen die Überschrift im DOM, klappen nötige Bereiche auf und scrollen hin (vorher landete der Sprung im ausgeblendeten Abschnitt). Test 2: „Sprung zu Tabellen“. |
 
-Regressionstests: `node tests/regression.js`, 19 Tests, alle bestanden; darunter ein Durchlauf von `processSection` mit Plugin-Instanz für den `%%`-Fall. Typprüfung weiter ohne Fehler.
+Regressionstests (Stand 1.2.0): `node tests/regression.js`, 19 Tests, alle bestanden; darunter ein Durchlauf von `processSection` mit Plugin-Instanz für den `%%`-Fall. Typprüfung weiter ohne Fehler.
 
 ### Nicht behoben, mit Grund
 
